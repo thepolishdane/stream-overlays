@@ -445,6 +445,7 @@ var PLATFORM_ICON_URLS = {
 };
 var PLATFORM_FALLBACK = {
   streamelements: { letter: 'SE', bg: '#36c46c' },
+  streamlabs:     { letter: 'SL', bg: '#80f5d2' },
   unknown:        { letter: '?',  bg: '#666' }
 };
 function platformIconHtml(platform) {
@@ -647,6 +648,74 @@ function normalizeStreamElementsEvent(ev) {
     id: 'se-' + (ev._id || Date.now()),
     raw: ev,
     meta: ev.event === 'event:test' ? { test: true } : {}
+  };
+}
+
+/* --- Streamlabs realtime (donations).
+   Token is sensitive — keep the URL local. Find it at:
+     streamlabs.com/dashboard#/apisettings → API Tokens → "Your Socket API Token"
+   Mirrors SE policy: tips/donations only. Twitch/YT subs/follows/bits/raids
+   come from SSN's own platform sources and would duplicate if emitted here too.
+   Reuses the socket.io 2.x client loaded by SE if present; otherwise loads it. */
+var slToken = urlParams.get('streamlabs_token');
+if (slToken) {
+  if (typeof io !== 'undefined') {
+    connectStreamlabs(slToken);
+  } else {
+    var slScript = document.createElement('script');
+    slScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.2.0/socket.io.js';
+    slScript.onload = function () { connectStreamlabs(slToken); };
+    slScript.onerror = function () { console.error('[SL] socket.io load failed'); };
+    document.head.appendChild(slScript);
+  }
+}
+
+function connectStreamlabs(token) {
+  if (typeof io === 'undefined') { console.error('[SL] socket.io not loaded'); return; }
+  var sock = io('https://sockets.streamlabs.com?token=' + encodeURIComponent(token), { transports: ['websocket'] });
+  sock.on('connect', function () { if (debugMode) console.log('[SL] connected'); });
+  sock.on('disconnect', function (r) { if (debugMode) console.warn('[SL] disconnected:', r); });
+  sock.on('error', function (e) { console.error('[SL] error:', e); });
+  sock.on('event', function (ev) {
+    if (debugMode) console.log('[SL]', ev);
+    if (!ev || !ev.type) return;
+    var messages = Array.isArray(ev.message) ? ev.message : (ev.message ? [ev.message] : []);
+    messages.forEach(function (m) {
+      var canonical = normalizeStreamlabsEvent(ev.type, ev.for, m, ev);
+      if (canonical) handleCanonical(canonical);
+    });
+  });
+}
+
+function normalizeStreamlabsEvent(type, source, msg, fullEv) {
+  if (!msg) return null;
+  /* Donations only. Other types (subscription/follow/bits/raid/host/superchat)
+     would dedupe with SSN's Twitch/YT sources. Easy to extend if needed. */
+  if (type !== 'donation') return null;
+  var amt = (typeof msg.amount === 'number') ? msg.amount : parseFloat(msg.amount);
+  var isTest = !!(fullEv && (fullEv.for === 'test' || msg.isTest || msg._is_test));
+  return {
+    type: 'donation',
+    platform: 'streamlabs',
+    user: {
+      name: msg.from || msg.name || 'Anonymous',
+      avatar: '',
+      color: '',
+      badges: [],
+      vip: false,
+      membership: ''
+    },
+    amount: {
+      value: isNaN(amt) ? null : amt,
+      unit: (msg.currency || 'USD').toLowerCase(),
+      raw: msg.formatted_amount || ((msg.amount != null ? msg.amount : '?') + ' ' + (msg.currency || ''))
+    },
+    message: { text: msg.message || '', html: '' },
+    timestamp: Date.now(),
+    iso: new Date().toISOString(),
+    id: 'sl-' + (fullEv && fullEv.event_id ? fullEv.event_id : (msg._id || Date.now())),
+    raw: fullEv,
+    meta: isTest ? { test: true } : {}
   };
 }
 
