@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SSN Activity Feed</title>
+<!--
+  Activity dock for OBS / browser source. Sister file to sampleoverlay.html.
+  Same SSN iframe + WS plumbing, different rendering: events instead of chat.
+  - Receives raw SSN payloads, runs them through normalizer.js
+  - Filters out plain chat (kind=='message'), test, viewer_update (drives stats bar), delete, unknown
+  - Renders sub/resub/gift_sub/gift/donation/cheer/hearts/raid/follow/highlight/system
+
+  URL params:
+    ?session=<ssn-room-id>     SSN room id (defaults to host's known room)
+    &isdock=true               compact dock mode (28px stats bar, smaller fonts)
+    &debug=true                console payload dump + red DEBUG banner
+    &fakedata=true             pre-populate dock with sample events for OBS layout
+    &maxitems=N                max rows in scrolling history (default 30)
+    &server=<wss-url>          extra socket server (matches chat overlay)
+    &capture=true              same JSON capture mode as chat overlay (forensic)
+-->
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;700&display=swap');
+
+body, html {
+  margin: 0; padding: 0; width: 100%; height: 100%;
+  font-family: 'Poppins', sans-serif;
+  background-color: transparent !important;
+  overflow: hidden; box-sizing: border-box;
+  text-shadow: 1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 0px 2px 2px rgba(0,0,0,0.8);
+  color: #ffffff;
+  font-size: 26px;
+}
+
+#activity-container {
+  position: absolute;
+  top: 0; bottom: 0; left: 0; right: 0;
+  padding: 10px;
+  display: flex; flex-direction: column;
+  box-sizing: border-box;
+  gap: 6px;
+}
+
+#join-ticker:empty,
+#pinned-feed:empty { display: none; }
+
+#join-ticker {
+  display: flex; flex-direction: column;
+  gap: 3px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.15);
+  flex: 0 0 auto;
+}
+
+#pinned-feed {
+  display: flex; flex-direction: column;
+  gap: 4px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.15);
+  flex: 0 0 auto;
+}
+
+#activity-list {
+  display: flex; flex-direction: column;
+  gap: 6px;
+  flex: 1 1 auto;
+  justify-content: flex-end;
+  overflow: hidden;
+}
+
+/* &scroll=true — natural mouse-wheel scrolling, auto-sticks to bottom unless user scrolled up. */
+body.scroll-mode #activity-list {
+  overflow-y: auto !important;
+  justify-content: flex-start !important;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.3) transparent;
+}
+body.scroll-mode #activity-list::-webkit-scrollbar { width: 8px; }
+body.scroll-mode #activity-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.3); border-radius: 4px; }
+body.scroll-mode #activity-list::-webkit-scrollbar-track { background: transparent; }
+
+/* FIFO ticker rows (joins, shares) — minimal, never lock */
+.ticker-row {
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: 3px;
+  padding: 3px 8px 3px 10px;
+  font-size: 0.6em;
+  display: flex; align-items: center; gap: 6px;
+  border-left: 2px solid var(--edge-color, #4cd137);
+  opacity: 0;
+  transform: translateY(-8px);
+  transition: opacity 0.25s ease-out, transform 0.25s ease-out;
+}
+.ticker-row.visible { opacity: 1; transform: translateY(0); }
+.ticker-row .icon { font-size: 12px; opacity: 0.7; }
+.ticker-row .user { font-weight: 700; }
+.ticker-row .label { color: rgba(255,255,255,0.6); font-size: 0.9em; text-transform: lowercase; }
+.ticker-row.join  { --edge-color: #4cd137; }
+.ticker-row.share { --edge-color: #ffd700; }
+
+.activity {
+  --edge-color: #ffffff;
+  background: rgba(0, 0, 0, var(--bg-alpha, 0.5));
+  border-radius: 6px;
+  padding: 8px 12px 8px 16px;
+  position: relative;
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 0.3s ease-out, transform 0.3s ease-out;
+  word-wrap: break-word;
+  line-height: 1.35;
+}
+.activity::before {
+  content: ""; position: absolute; left: 0; top: 4px; bottom: 4px;
+  width: 4px; border-radius: 4px;
+  background-color: var(--edge-color);
+}
+.activity.visible { opacity: 1; transform: translateY(0); }
+.activity.fading { opacity: 0; transition: opacity 1.5s ease-out; }
+
+.activity .row1 {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.activity .icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px;
+  font-size: 16px; line-height: 1;
+  flex-shrink: 0;
+}
+.activity .platform-icon {
+  width: 18px; height: 18px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  vertical-align: middle;
+  background: rgba(255,255,255,0.05);
+}
+body.dock .activity .platform-icon { width: 14px; height: 14px; border-radius: 3px; }
+.streak .platform-icon { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+.ticker-row .platform-icon { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
+.activity .label {
+  font-family: 'Inter', sans-serif;
+  font-weight: 800;
+  font-size: 0.6em;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--edge-color);
+  margin-right: 2px;
+}
+.activity .user {
+  font-weight: 700;
+  font-size: 0.85em;
+}
+.activity .amount {
+  font-weight: 700;
+  color: #ffd700;
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+  font-size: 0.85em;
+}
+.activity .h-count {
+  font-family: 'Inter', sans-serif;
+  font-weight: 700;
+  font-size: 0.7em;
+  color: #ffd700;
+  font-variant-numeric: tabular-nums;
+}
+.activity .body {
+  font-size: 0.7em;
+  font-weight: 500;
+  margin-top: 2px;
+  color: rgba(255, 255, 255, 0.92);
+}
+.activity .meta-line {
+  font-family: 'Inter', sans-serif;
+  font-size: 0.55em;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.65);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-top: 2px;
+}
+
+/* Per-type accent colors. Edge bar + label tint. */
+.activity.sub        { --edge-color: #9146FF; }
+.activity.resub      { --edge-color: #b97aff; }
+.activity.gift_sub   { --edge-color: #ffb84d; }
+.activity.gift       { --edge-color: #69C9D0; }
+.activity.hearts     { --edge-color: #ff66c4; }
+.activity.raid       { --edge-color: #ff4dff; --bg-alpha: 0.65; }
+.activity.follow     { --edge-color: #4cd137; }
+.activity.highlight  { --edge-color: #ffd700; }
+.activity.system     { --edge-color: #888; }
+.activity.donation   { --edge-color: #FF6A6A; --bg-alpha: 0.6; }
+.activity.cheer      { --edge-color: #00d4ff; --bg-alpha: 0.6; }
+.activity.reward     { --edge-color: #a970ff; }
+
+/* Streak row in pinned-feed */
+.streak {
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 4px;
+  padding: 4px 10px 4px 12px;
+  font-size: 0.7em;
+  display: flex; align-items: center; gap: 8px;
+  position: relative;
+  border-left: 3px solid var(--edge-color, #4cd137);
+}
+.streak .user { font-weight: 700; }
+.streak .count { margin-left: auto; font-weight: 700; color: #ffd700; font-variant-numeric: tabular-nums; }
+
+/* Dock mode — matches chat overlay. Stats bar lives on the chat dock only;
+   the activity dock takes the full height. */
+body.dock {
+  background-color: #18181b !important;
+  font-size: 16px;
+  text-shadow: none;
+}
+body.dock #activity-container { padding: 8px; }
+body.dock .activity { padding: 5px 8px 5px 12px; border-radius: 4px; }
+body.dock .activity .icon { width: 18px; height: 18px; font-size: 13px; }
+body.dock .activity .row1 { gap: 6px; }
+
+/* Debug banner */
+#debug-banner {
+  position: fixed; top: 4px; left: 4px; z-index: 9999;
+  background: rgba(255, 0, 0, 0.85);
+  color: #fff; padding: 4px 10px;
+  font-family: monospace; font-size: 12px; font-weight: 700;
+  border-radius: 4px;
+  text-shadow: none;
+  pointer-events: none;
+  display: none;
+}
+body.debug #debug-banner { display: block; }
+body.dock.debug #debug-banner { top: 32px; }
+</style>
+</head>
+<body>
+<div id="debug-banner">DEBUG</div>
+
+<div id="activity-container">
+  <div id="join-ticker"></div>
+  <div id="pinned-feed"></div>
+  <div id="activity-list"></div>
+</div>
+
+<script src="activity-feed/normalizer.js"></script>
+<script>
+'use strict';
+
+var urlParams = new URLSearchParams(location.search);
+
+/* defaults match chat overlay so the dock URL stays similar */
+var roomID = "iWWnKL28tQ";
+if (urlParams.has("session")) roomID = urlParams.get("session");
+var password = "false";
+var featuredMode = false;
+
+var debugMode  = urlParams.has("debug")  && urlParams.get("debug")  !== "false";
+var captureMode= urlParams.has("capture")&& urlParams.get("capture")!== "false";
+var isDock     = urlParams.has("isdock") && urlParams.get("isdock") === "true";
+var fakeData   = urlParams.has("fakedata") && urlParams.get("fakedata") !== "false";
+var scrollMode = urlParams.has("scroll") && urlParams.get("scroll") !== "false";
+var maxItems   = parseInt(urlParams.get("maxitems") || "60", 10);
+var tickerMax  = parseInt(urlParams.get("tickermax") || "8", 10);
+var showtime   = parseInt(urlParams.get("showtime") || "0", 10); /* 0 = never auto-fade */
+
+if (isDock) document.body.classList.add('dock');
+if (debugMode) document.body.classList.add('debug');
+if (scrollMode) document.body.classList.add('scroll-mode');
+
+/* Gift lookup loaded from local activity-feed/tiktok-gifts.json on overlay open.
+   The JSON ships 400+ gifts scraped from streamtoearn.io (see activity-feed/README
+   for re-scrape instructions). Aliases section maps localized names (e.g. Danish)
+   to the canonical English entries. Events that arrive before the fetch resolves
+   simply get gift_unmapped:true and stay flagged in the meta-line. */
+var giftLookup = {};
+fetch('activity-feed/tiktok-gifts.json?_=' + Date.now())
+  .then(function (r) { return r.ok ? r.json() : { gifts: {}, aliases: {} }; })
+  .then(function (j) {
+    var lookup = {};
+    /* base catalog */
+    var g = (j && j.gifts) || {};
+    Object.keys(g).forEach(function (k) {
+      if (typeof g[k] === 'number') lookup[k.toLowerCase()] = g[k];
+    });
+    /* aliases: localized name -> canonical (looked up in same catalog) */
+    var aliases = (j && j.aliases) || {};
+    Object.keys(aliases).forEach(function (loc) {
+      var canon = String(aliases[loc]).toLowerCase();
+      if (lookup[canon] != null) lookup[loc.toLowerCase()] = lookup[canon];
+    });
+    giftLookup = lookup;
+    if (debugMode) console.log('[activity] gift lookup loaded:', Object.keys(giftLookup).length);
+  })
+  .catch(function (e) { console.warn('[activity] gift lookup load failed:', e && e.message || e); });
+
+/* --- canonical event handler --- */
+var FEED_TYPES_SKIP = { message: 1, viewer_update: 1, delete: 1, test: 1, unknown: 1 };
+
+/* high-volume per-user types: streak grouping in pinned-feed, lock-to-feed after 10s */
+var STREAK_TYPES = { like: 1 };
+var STREAK_INACTIVITY_MS = 10000;
+var streaks = {}; /* key = type + '|' + user, value = {row, count, lastTs, timer} */
+
+/* high-volume one-shot-per-user types: FIFO ticker, never lock to main feed */
+var TICKER_TYPES = { join: 1, share: 1 };
+
+/* Twitch community-highlight panel re-broadcasts the same fragments every ~30s.
+   Group by content: first occurrence creates a row, repeats bump a ×N counter
+   and move the row to the bottom of the list so it stays visible. */
+var highlightRows = {}; /* key (joined fragments) -> { row, count } */
+function highlightKey(ev) {
+  var frags = (ev.meta && ev.meta.fragments) || [];
+  return Array.isArray(frags) ? frags.join('|') : (ev.message && ev.message.text) || '';
+}
+
+/* Stats bar lives only on the chat dock now. Activity feed ignores viewer_update
+   events (still routed below for clarity, but the handler is a no-op). */
+function setPlatformPill(_platform, _count) { /* no-op */ }
+
+function classifyKind(p) {
+  if (!p || typeof p !== 'object') return 'event';
+  if (p.event) return 'event';
+  if (p.hasDonation || p.donation) return 'event';
+  if (p.membership) return 'event';
+  if (p.chatmessage) return 'chat';
+  if (p.chatname) return 'event';
+  return 'event';
+}
+
+function wrapEntry(payload, source) {
+  return {
+    ts: Date.now(),
+    iso: new Date().toISOString(),
+    source: source,
+    kind: classifyKind(payload),
+    platform: ((payload && payload.type) || 'unknown').toLowerCase(),
+    eventType: (payload && payload.event !== undefined ? payload.event : 'unknown'),
+    payload: payload || {}
+  };
+}
+
+function ingest(payload, source) {
+  if (debugMode) {
+    try { console.log('[activity-debug]', source, JSON.parse(JSON.stringify(payload))); }
+    catch (_) { console.log('[activity-debug]', source, payload); }
+  }
+  var entry = wrapEntry(payload, source);
+  var n = window.SSNNormalize.normalize(entry, { giftLookup: giftLookup });
+  if (!n) return;
+  var arr = Array.isArray(n) ? n : [n];
+  arr.forEach(handleCanonical);
+}
+
+function handleCanonical(ev) {
+  if (ev.type === 'viewer_update') {
+    setPlatformPill(ev.platform, ev.amount && ev.amount.value);
+    return;
+  }
+  if (FEED_TYPES_SKIP[ev.type]) return;
+  if (TICKER_TYPES[ev.type] && ev.user && ev.user.name) {
+    addToTicker(ev);
+    return;
+  }
+  if (STREAK_TYPES[ev.type] && ev.user && ev.user.name) {
+    addToStreak(ev);
+    return;
+  }
+  addToFeed(ev);
+}
+
+/* Single-line ticker: ONE persistent row per type (join/share). Latest event
+   overwrites the slot; no stacking, no scrollback. Uses Web Animations API
+   instead of CSS-transition class flipping — CEF (OBS Chromium 127) batches
+   rapid class toggles as no-ops, leaving the row stuck on the first joiner
+   even though innerHTML keeps updating. WAAPI bypasses that. */
+function addToTicker(ev) {
+  var ticker = document.getElementById('join-ticker');
+  var row = ticker.querySelector('.ticker-row.' + ev.type);
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'ticker-row ' + ev.type + ' visible';
+    ticker.appendChild(row);
+  }
+  row.innerHTML = platformIconHtml(ev.platform)
+    + '<span class="user">' + escapeHtml(ev.user.name) + '</span>'
+    + '<span class="label">' + ev.type + '</span>';
+  if (typeof row.animate === 'function') {
+    row.animate(
+      [
+        { opacity: 0, transform: 'translateY(-8px)' },
+        { opacity: 1, transform: 'translateY(0)' }
+      ],
+      { duration: 250, easing: 'ease-out' }
+    );
+  }
+}
+
+/* --- streak slot (pinned, locks after inactivity) --- */
+function streakKey(ev) { return ev.type + '|' + (ev.user && ev.user.name || '?'); }
+function addToStreak(ev) {
+  var key = streakKey(ev);
+  var s = streaks[key];
+  if (!s) {
+    var row = document.createElement('div');
+    row.className = 'streak ' + ev.type;
+    row.style.setProperty('--edge-color', getComputedStyle(document.documentElement).getPropertyValue('--edge-color') || '#4cd137');
+    row.innerHTML = platformIconHtml(ev.platform) + '<span class="user"></span><span class="meta-line"></span><span class="count">×<span class="num">1</span></span>';
+    document.getElementById('pinned-feed').appendChild(row);
+    s = streaks[key] = { row: row, count: 0, lastTs: 0, timer: null, ev: ev };
+    row.querySelector('.user').textContent = ev.user.name;
+    row.querySelector('.meta-line').textContent = (ev.platform || '') + ' · ' + ev.type;
+  }
+  s.count++;
+  s.lastTs = Date.now();
+  s.row.querySelector('.num').textContent = s.count;
+  if (s.timer) clearTimeout(s.timer);
+  s.timer = setTimeout(function () { lockStreak(key); }, STREAK_INACTIVITY_MS);
+}
+function lockStreak(key) {
+  var s = streaks[key]; if (!s) return;
+  delete streaks[key];
+  /* turn the pinned streak into a single feed entry with final count */
+  var ev = Object.assign({}, s.ev, {
+    meta: Object.assign({}, s.ev.meta || {}, { streak_total: s.count, streak_locked: true })
+  });
+  s.row.parentNode && s.row.parentNode.removeChild(s.row);
+  ev._streakLabel = s.count + '× ' + ev.type;
+  addToFeed(ev);
+}
+
+/* --- main feed rendering --- */
+/* Platform icon URLs — SSN ships these. Falls back to a colored letter chip
+   for platforms we don't have an icon for (kick, rumble, etc.). */
+var PLATFORM_ICON_URLS = {
+  twitch:  'https://socialstream.ninja/sources/images/twitch.png',
+  youtube: 'https://socialstream.ninja/sources/images/youtube.png',
+  youtubeshorts: 'https://socialstream.ninja/sources/images/youtube.png',
+  tiktok:  'https://socialstream.ninja/sources/images/tiktok.png',
+  kick:    'https://socialstream.ninja/sources/images/kick.png',
+  facebook:'https://socialstream.ninja/sources/images/facebook.png',
+  discord: 'https://socialstream.ninja/sources/images/discord.png',
+  rumble:  'https://socialstream.ninja/sources/images/rumble.png'
+};
+var PLATFORM_FALLBACK = {
+  streamelements: { letter: 'SE', bg: '#36c46c' },
+  unknown:        { letter: '?',  bg: '#666' }
+};
+function platformIconHtml(platform) {
+  var p = (platform || '').toLowerCase();
+  var url = PLATFORM_ICON_URLS[p];
+  if (url) return '<img class="platform-icon" src="' + url + '" alt="' + escapeHtml(p) + '" title="' + escapeHtml(p) + '">';
+  var fb = PLATFORM_FALLBACK[p] || { letter: p ? p[0].toUpperCase() : '?', bg: '#666' };
+  return '<span class="platform-icon" style="background:' + fb.bg + '; color:#fff; display:inline-flex; align-items:center; justify-content:center; font-size:9px; font-weight:700;" title="' + escapeHtml(p) + '">' + escapeHtml(fb.letter) + '</span>';
+}
+
+function iconFor(ev) {
+  switch (ev.type) {
+    case 'sub':        return '★';
+    case 'resub':      return '★★';
+    case 'gift_sub':   return '🎁';
+    case 'gift':       return '🎁';
+    case 'donation':   return '💸';
+    case 'cheer':      return '✨';
+    case 'hearts':     return '❤';
+    case 'raid':       return '⚔';
+    case 'follow':     return '+';
+    case 'like':       return '❤';
+    case 'join':       return '→';
+    case 'share':      return '↗';
+    case 'highlight':  return '✦';
+    case 'reward':     return '🎯';
+    case 'system':     return 'ⓘ';
+    default:           return '·';
+  }
+}
+
+function fmtAmount(amount) {
+  if (!amount || amount.value == null) return '';
+  if (amount.unit === 'coins') return amount.value + ' coins';
+  if (amount.unit === 'gold')  return amount.value + ' SC';
+  if (amount.unit === 'hearts')return amount.value + ' ❤';
+  if (amount.unit === 'viewers') return amount.value + ' viewers';
+  /* SE tips: amount.unit is a 3-letter currency code, render with symbol prefix */
+  var currencySymbols = { usd: '$', eur: '€', gbp: '£', dkk: 'kr ', sek: 'kr ', nok: 'kr ', jpy: '¥' };
+  var sym = currencySymbols[amount.unit];
+  if (sym) return sym + amount.value;
+  return amount.value + ' ' + (amount.unit || '');
+}
+
+function fmtMeta(ev) {
+  var m = ev.meta || {};
+  var bits = [];
+  if (m.tier)      bits.push('Tier ' + m.tier);
+  if (m.membership && !m.tier) bits.push(m.membership); // canonical subs carry text not numeric tier
+  if (m.months)    bits.push(m.months + ' mo');
+  if (m.streak)    bits.push(m.streak + ' streak');
+  if (m.recipient) bits.push('→ ' + m.recipient);
+  if (m.gifter_total) bits.push(m.gifter_total + ' total gifts');
+  if (m.streak_count) bits.push(m.streak_count + '-stream streak');
+  if (m.gift_name) bits.push(m.gift_name + (m.count > 1 ? ' ×' + m.count : ''));
+  if (m.reward) bits.push(m.reward + (m.cost ? ' · ' + m.cost + ' pts' : ''));
+  if (m.streak_total) bits.push(m.streak_total + '× total');
+  if (m.source_channel) bits.push('via ' + m.source_channel);
+  return bits.join(' · ');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function addToFeed(ev) {
+  var list = document.getElementById('activity-list');
+  /* In scroll mode, only auto-scroll to bottom if the user hadn't scrolled up.
+     Threshold: within 60px of the bottom = "still at bottom, keep me there".
+     Beyond that means the user is reading older events; don't yank them down. */
+  var atBottom = !scrollMode || (list.scrollHeight - list.scrollTop - list.clientHeight) < 60;
+
+  /* Highlight grouping: repeat fragments → bump counter + move row to bottom. */
+  if (ev.type === 'highlight') {
+    var hKey = highlightKey(ev);
+    var slot = highlightRows[hKey];
+    if (slot && slot.row.parentNode === list) {
+      slot.count++;
+      var cEl = slot.row.querySelector('.h-count');
+      if (cEl) cEl.textContent = '×' + slot.count;
+      else {
+        var labelEl = slot.row.querySelector('.label');
+        if (labelEl) labelEl.insertAdjacentHTML('afterend', ' <span class="h-count">×' + slot.count + '</span>');
+      }
+      list.appendChild(slot.row); /* bump to bottom */
+      slot.row.classList.remove('visible');
+      void slot.row.offsetWidth;
+      requestAnimationFrame(function () { slot.row.classList.add('visible'); });
+      if (atBottom && scrollMode) list.scrollTop = list.scrollHeight;
+      return;
+    }
+  }
+
+  var div = document.createElement('div');
+  div.className = 'activity ' + ev.type;
+  var label = ev._streakLabel || ev.type.replace('_', ' ');
+  var userName = (ev.user && ev.user.name) || '';
+  var bodyText = ev.message && ev.message.text ? ev.message.text : '';
+  if (bodyText.length > 140) bodyText = bodyText.slice(0, 137) + '…';
+  var amount = fmtAmount(ev.amount);
+  var meta = fmtMeta(ev);
+
+  var html = '<div class="row1">'
+    + platformIconHtml(ev.platform)
+    + '<span class="label">' + escapeHtml(label) + '</span>';
+  if (userName) html += '<span class="user">' + escapeHtml(userName) + '</span>';
+  if (amount)   html += '<span class="amount">' + escapeHtml(amount) + '</span>';
+  html += '</div>';
+  if (bodyText && ev.type !== 'sub' && ev.type !== 'resub' && ev.type !== 'gift_sub' && ev.type !== 'follow') {
+    /* sub-style events have machine-generated descriptive HTML; meta-line already carries
+       the info, so the long body would be redundant noise */
+    html += '<div class="body">' + escapeHtml(bodyText) + '</div>';
+  }
+  if (meta) html += '<div class="meta-line">' + escapeHtml(meta) + '</div>';
+  div.innerHTML = html;
+  if (ev.type === 'highlight') {
+    var newKey = highlightKey(ev);
+    div.setAttribute('data-highlight-key', newKey);
+    highlightRows[newKey] = { row: div, count: 1 };
+  }
+  list.appendChild(div);
+  requestAnimationFrame(function () { div.classList.add('visible'); });
+
+  /* trim history */
+  while (list.children.length > maxItems) {
+    var removed = list.firstElementChild;
+    var rKey = removed && removed.getAttribute && removed.getAttribute('data-highlight-key');
+    if (rKey && highlightRows[rKey] && highlightRows[rKey].row === removed) {
+      delete highlightRows[rKey];
+    }
+    list.removeChild(removed);
+  }
+
+  if (atBottom && scrollMode) {
+    list.scrollTop = list.scrollHeight;
+  }
+}
+
+/* --- StreamElements realtime (donations).
+   Loads socket.io 2.2.0 client (per SE docs) only if &se_jwt=<token> is supplied.
+   JWT is sensitive — keep the URL local (file://). Find it at:
+     StreamElements dashboard → profile name → Channels tab → Show secrets → JWT Token
+   Currently filters to tip events only; cheers/subs/follows would dedupe with SSN
+   (already on Twitch side). Easy to extend below if you want SE-tracked follows etc. */
+var seJwt = urlParams.get('se_jwt');
+if (seJwt) {
+  var seScript = document.createElement('script');
+  seScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.2.0/socket.io.js';
+  seScript.onload = function () { connectStreamElements(seJwt); };
+  seScript.onerror = function () { console.error('[SE] socket.io load failed'); };
+  document.head.appendChild(seScript);
+}
+
+function connectStreamElements(jwt) {
+  if (typeof io === 'undefined') { console.error('[SE] socket.io not loaded'); return; }
+  var sock = io('https://realtime.streamelements.com', { transports: ['websocket'] });
+  sock.on('connect', function () {
+    if (debugMode) console.log('[SE] connected, authenticating');
+    sock.emit('authenticate', { method: 'jwt', token: jwt });
+  });
+  sock.on('authenticated', function (d) { if (debugMode) console.log('[SE] authenticated:', d); });
+  sock.on('unauthorized', function (e) { console.error('[SE] unauthorized:', e); });
+  sock.on('disconnect', function (r) { if (debugMode) console.warn('[SE] disconnected:', r); });
+  /* SE delivers two channels: 'event' (production) and 'event:test' (test buttons in dashboard).
+     Listen to both so the user can validate by firing a test tip from the SE panel. */
+  ['event', 'event:test'].forEach(function (channel) {
+    sock.on(channel, function (ev) {
+      if (debugMode) console.log('[SE]', channel, ev);
+      var canonical = normalizeStreamElementsEvent(ev);
+      if (canonical) handleCanonical(canonical);
+    });
+  });
+}
+
+function normalizeStreamElementsEvent(ev) {
+  if (!ev || ev.type !== 'tip') return null;  /* tips/donos only for now */
+  var d = ev.data || {};
+  var amt = (typeof d.amount === 'number') ? d.amount : parseFloat(d.amount);
+  return {
+    type: 'donation',
+    platform: 'streamelements',
+    user: {
+      name: d.displayName || d.username || 'Anonymous',
+      avatar: d.avatar || '',
+      color: '',
+      badges: [],
+      vip: false,
+      membership: ''
+    },
+    amount: {
+      value: isNaN(amt) ? null : amt,
+      unit: (d.currency || 'USD').toLowerCase(),
+      raw: (d.amount != null ? d.amount : '?') + ' ' + (d.currency || '')
+    },
+    message: { text: d.message || '', html: '' },
+    timestamp: Date.now(),
+    iso: new Date().toISOString(),
+    id: 'se-' + (ev._id || Date.now()),
+    raw: ev,
+    meta: ev.event === 'event:test' ? { test: true } : {}
+  };
+}
+
+/* --- SSN ingestion: iframe + WS, copied 1:1 from sampleoverlay.html --- */
+var iframe = document.createElement('iframe');
+if (featuredMode) {
+  iframe.src = 'https://vdo.socialstream.ninja/?ln&password=' + password + '&salt=vdo.ninja&label=overlay&exclude=' + roomID + '&scene&novideo&noaudio&cleanoutput&room=' + roomID;
+} else {
+  iframe.src = 'https://vdo.socialstream.ninja/?ln&salt=vdo.ninja&password=' + password + '&push&label=dock&vd=0&ad=0&novideo&noaudio&autostart&cleanoutput&room=' + roomID;
+}
+iframe.style.cssText = 'width: 0px; height: 0px; position: fixed; left: -100px; top: -100px;';
+document.body.appendChild(iframe);
+window.addEventListener('message', function (e) {
+  if (e.source != iframe.contentWindow) return;
+  if (e.data && e.data.dataReceived && e.data.dataReceived.overlayNinja) {
+    ingest(e.data.dataReceived.overlayNinja, 'iframe');
+  }
+});
+
+var conCon = 1;
+var socketserver = false;
+var serverURL = urlParams.has("localserver") ? "ws://127.0.0.1:3000" : "wss://io.socialstream.ninja";
+function setupSocket() {
+  socketserver.onclose = function () {
+    setTimeout(function () { conCon += 1; socketserver = new WebSocket(serverURL); setupSocket(); }, 100 * conCon);
+  };
+  socketserver.onopen = function () {
+    conCon = 1;
+    socketserver.send(JSON.stringify({ join: roomID, out: 3, in: 4 }));
+  };
+  socketserver.addEventListener('message', function (event) {
+    if (!event.data) return;
+    try {
+      var data = JSON.parse(event.data);
+      if (data) ingest(data, 'websocket');
+    } catch (err) { console.error('WS parse error:', err); }
+  });
+}
+if (urlParams.has("server") || urlParams.has("server2")) {
+  serverURL = urlParams.get("server") || urlParams.get("server2") || serverURL;
+  socketserver = new WebSocket(serverURL);
+  setupSocket();
+}
+
+/* --- fake data for layout previewing in OBS --- */
+if (fakeData) {
+  var samples = [
+    { type: 'join',       platform: 'tiktok',  user: { name: 'lurker_42' },       message: { text: '' }, meta: {} },
+    { type: 'follow',     platform: 'tiktok',  user: { name: 'noob_in_action2' }, message: { text: 'følger værten' }, meta: {} },
+    { type: 'donation',   platform: 'youtube', user: { name: 'Bob' },             amount: { value: 2500, unit: 'gold' }, message: { text: 'Looking good! 😘' }, meta: {} },
+    { type: 'donation',   platform: 'streamelements', user: { name: 'GenerousGamer' }, amount: { value: 25, unit: 'dkk' }, message: { text: 'Keep it up!' }, meta: {} },
+    { type: 'hearts',     platform: 'youtubeshorts', user: { name: 'Lucy' },      amount: { value: 3, unit: 'hearts' }, message: { text: '' }, meta: {} },
+    { type: 'gift',       platform: 'tiktok',  user: { name: 'ItZ168days' },      amount: { value: 1, unit: 'coins', raw: 'Synes godt om mig x 1' }, message: { text: 'har sendt Synes godt om mig x 1' }, meta: { gift_name: 'Synes godt om mig', count: 1 } },
+    { type: 'join',       platform: 'tiktok',  user: { name: 'casual_viewer' },   message: { text: '' }, meta: {} },
+    { type: 'resub',      platform: 'twitch',  user: { name: 'rich_mukkelguden' },message: { text: '' }, meta: { tier: 1, months: 60, streak: 6 } },
+    { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    message: { text: 'liked' }, meta: {} },
+    { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    message: { text: 'liked' }, meta: {} },
+    { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    message: { text: 'liked' }, meta: {} },
+    { type: 'gift_sub',   platform: 'twitch',  user: { name: 'Viprcsgo' },        message: { text: '' }, meta: { tier: 1, recipient: 'Klovn', gifter_total: 14 } },
+    { type: 'raid',       platform: 'twitch',  user: { name: '' },                amount: { value: 22, unit: 'viewers' }, message: { text: 'gruppe på 22' }, meta: { viewer_count: 22 } },
+    { type: 'highlight',  platform: 'twitch',  user: null,                        message: { text: 'Delt chat startet!' }, meta: { fragments: ['Delt chat startet!'] } }
+  ];
+  samples.forEach(function (e, i) { setTimeout(function () { handleCanonical(e); }, 200 * (i + 1)); });
+}
+</script>
+</body>
+</html>

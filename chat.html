@@ -1,0 +1,1538 @@
+<!DOCTYPE html>
+<!-- AI GUIDANCE FOR EDITING THIS OVERLAY -->
+<!--
+This is a Social Stream Ninja (SSN) chat overlay that displays messages from various platforms.
+If editing this file, please note:
+
+1. CORE FUNCTIONALITY:
+   - Messages arrive via WebRTC (iframe) or WebSocket (if &server parameter is used)
+   - Session ID is crucial - users must provide &session in URL parameters
+   - Message structure includes: {chatname, chatmessage, chatimg, type, contentimg, etc.}
+   - "type" field indicates source platform (youtube, twitch, x, kick, etc.)
+
+2. SCROLLING MECHANISM:
+   - New messages are added at the bottom
+   - Page scrolls upward using CSS transforms on #message-list-wrapper
+   - The spacer element manages scroll position as older messages are removed
+   - DO NOT modify the scroll logic without thorough testing
+
+3. STYLING GUIDELINES:
+   - Edit .message, .text, .name styles to change message appearance
+   - Images/badges have size constraints to maintain layout
+   - Background is transparent (#0000) for OBS overlay compatibility
+   - Message animations use CSS transitions for fade-in/out effects
+
+4. BEST PRACTICES:
+   - Test any changes with different message types
+   - Preserve the iframe implementation for WebRTC functionality
+   - Maintain opacity/transform animations for smooth message display
+   - Keep the maximum message count logic intact
+   
+This overlay works by:
+1. Receiving messages through WebRTC data channels (iframe) or WebSocket
+2. Creating message DOM elements with proper styling based on message type
+3. Animating messages in/out with CSS transitions
+4. Managing scroll position to keep newest messages visible
+5. Removing oldest messages when count exceeds MAX_MESSAGES
+
+URL PARAMS (custom additions on top of standard SSN ones):
+- &twitchchannel=NAME      — host channel name; enables Twitch IRC enrichment
+                              (required for shared-chat marker)
+- &collabchannels=A,B,C    — collab partners' channel names; lets us resolve
+                              source-room-id to actual channel names + pfp
+- &scroll=true             — mouse-wheel scrollable mode (auto-sticks to bottom)
+- &debug=true              — logs full message JSON + IRC events to console
+- &bgalpha=0.4             — message backdrop opacity (0=transparent, 1=solid).
+                              Default 0.4. Useful for tuning readability over
+                              bright vs. dark gameplay.
+- &fakestats=true          — pre-populate the dock stats bar with placeholder
+                              numbers (20/55/122) for layout previewing in OBS
+                              before SSN's first viewer_update arrives.
+- &capture=true            — DISCOVERY MODE for the upcoming activity-feed dock.
+                              Buffers EVERY raw inbound payload (iframe + WS),
+                              tags chat-vs-event, shows a fixed top-right panel
+                              with live counters, and offers a JSON download +
+                              window.__ssn_capture console handle. Auto-saves
+                              every 5s to localStorage. Run on one stream to
+                              gather ground-truth event shapes per platform
+                              (subs / bits / raids / super-chats / TT likes /
+                              joins / donations) before writing the normalizer.
+                              Make sure SSN extension settings have "send
+                              events" / "send system messages" enabled or you
+                              will only see chat.
+- &mychannel=...           — DEPRECATED, see SHARED-CHAT note below
+
+SHARED-CHAT MARKER STATUS (verified 2026-05-03 against SSN main):
+SSN does NOT surface Twitch Shared Chat origin in any of its code paths
+(DOM scraper, websocket Twitch client, chatClient.js with tmi.js — all checked).
+The IRC source-room-id / source-id / source-badges tags exist but SSN throws
+them away.
+
+WORKAROUND: We open our own anonymous Twitch IRC connection (justinfan login,
+no auth required) and JOIN the host channel + any collab channels. We capture
+each PRIVMSG's source-room-id tag and cross-reference incoming SSN messages
+by chatname (case-insensitive) within a 5-second window. When a match has
+source-room-id !== room-id, we inject a marker into the rendered message DIV.
+
+Trade-offs:
+- Match keyed on chatname only (no userid in SSN twitch DOM scraper output).
+  Two users with identical display-names in the window = match collision.
+  Twitch enforces unique display-names per user globally, so this is theoretical.
+- Marker glyph: generic chain-link SVG (gold). Per-channel avatars would need
+  room-id -> channel-name resolution; only public path is to manually list
+  &collabchannels=, which we don't want to require. Generic glyph also scales
+  cleanly to multi-party shared chats.
+- The dormant &mychannel logic below is left in place but unused; remove later.
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat Overlay</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+    <script src="https://socialstream.ninja/libs/colours.js" type="text/javascript"></script>
+    <!-- Links to Social Stream Ninja resources -->
+    <link rel="canonical" href="https://socialstream.ninja/">
+    <meta name="generator" content="Social Stream Ninja - https://github.com/steveseguin/social_stream">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;700&display=swap');
+
+body, html {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    font-family: 'Poppins', sans-serif;
+    background-color: transparent !important;
+    overflow: hidden;
+    box-sizing: border-box;
+    /* Twitch-style text outline for readability against bright gameplay */
+    text-shadow: 1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 0px 2px 2px rgba(0,0,0,0.8);
+    color: #ffffff;
+    font-size: 32px;
+}
+
+#chat-container {
+    position: absolute;
+    bottom: 0;
+    left: 0; 
+    transform: none; 
+    width: 100%;
+    height: 100vh;
+    overflow: hidden;
+    padding: 10px;
+    box-sizing: border-box;
+}
+
+#message-list-wrapper {
+    width: 100%;
+    transition: transform 0.2s ease-out; 
+}
+
+/* Core Message Wrapper.
+   Padding is symmetric top/bottom so the colored bar sits evenly around
+   the text regardless of how many lines the message wraps to. */
+.message {
+    background: rgba(0, 0, 0, var(--message-bg-alpha, 0.4)) !important;
+    border-radius: 6px;
+    padding: 7px 8px 7px 15px !important;
+    margin-bottom: 6px !important;
+    border: none !important;
+    box-shadow: none !important;
+    color: #ffffff;
+    opacity: 0;
+    transform: translateY(30px);
+    transition: opacity 0.3s ease-out, transform 0.3s ease-out;
+    overflow: visible !important;
+    position: relative;
+    --scroll-opacity: 1;
+    filter: opacity(var(--scroll-opacity));
+    will-change: transform, opacity, filter;
+    word-wrap: break-word;
+}
+
+/* The Floating Platform Anchor Line.
+   Pixel offsets (not percentages) so the bar's distance from text top/bottom
+   stays constant whether the message is 1 line or 5 lines. */
+.message::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 4px;
+    bottom: 4px;
+    width: 4px;
+    border-radius: 4px;
+    background-color: var(--edge-color, #ffffff);
+}
+
+.message.proximity-fading { --scroll-opacity: 0; }
+.message.visible { opacity: 1; transform: translateY(0); }
+.message.fading { opacity: 0; transition: opacity 1.5s ease-out; }
+.message.hidden {
+    opacity: 0;
+    transform: translateY(-30px);
+    max-height: 0px !important;
+    padding-top: 0px !important;
+    padding-bottom: 0px !important;
+    margin-bottom: 0px !important;
+    border-width: 0px !important;
+}
+
+/* FLATTEN THE GRID: 
+  This forces the Username, Badges, and Text to sit on the same line 
+*/
+.message-content-wrapper, 
+.message-text-meta, 
+.message-text-meta > div {
+    display: inline !important; 
+}
+
+/* Hide Avatars completely */
+.avatar-wrapper { display: none !important; }
+
+/* Name Formatting */
+.name-bg {
+    background: transparent !important;
+    padding: 0 !important;
+    display: inline !important;
+    margin: 0 !important;
+}
+
+/* Usernames: Let native colors show, reduce the extreme boldness */
+.name {
+    display: inline !important;
+    font-weight: 700 !important; /* Dropped from 800 (Extra Bold) to 700 (Bold) */
+    font-size: 1em;
+    /* I completely removed the 'color: #ffffff' line so native colors work! */
+}
+
+/* The colon after the name (Keep this white or light gray) */
+.name::after {
+    content: ":";
+    color: #dedede !important; 
+    margin-right: 4px;
+    font-weight: 700;
+}
+
+/* Add the Twitch colon after the name */
+.name::after {
+    content: ":";
+    margin-right: 4px;
+}
+
+/* Keep the Platform Icon (YT/Twitch/TikTok) */
+.source-icon {
+    display: inline-block !important;
+    width: 36px !important; 
+    height: 36px !important; 
+    vertical-align: middle !important;
+    margin-right: 8px !important;
+    margin-bottom: 4px !important;
+}
+
+/* NUKE ALL OTHER BADGES (Subs/Mods) AND MEMBERSHIP TEXT */
+.badge, .membership-status, .source-icon {
+    display: none !important;
+}
+
+/* Text Formatting */
+/* The Message: Pure white and slightly thicker for readability */
+.text {
+    display: inline !important;
+    font-size: 1em;
+    line-height: 1.4;
+    margin: 0 !important;
+    color: #ffffff !important; /* Pure bright white so the message pops */
+    font-weight: 500 !important; /* Medium weight (thicker than normal, but thinner than the name) */
+}
+
+.text img {
+    max-width: 150px;
+    max-height: 48px;
+    vertical-align: middle !important;
+    margin: -4px 0 !important;
+}
+
+/* Reply / thread quote prefix.
+   SSN injects the quoted message inline at the start of chatmessage as:
+   <i><small>Replying to @user: original message:&nbsp;</small></i> actual reply
+   At render time we parse that leading block out and remount it as a
+   separate <div class="reply-prefix"> ABOVE the username line, inside
+   the same .message box (so the colored bar still wraps both lines). */
+.reply-prefix {
+    display: block;
+    font-style: normal !important;
+    font-size: 16px;
+    line-height: 1.3;
+    font-weight: 400 !important;
+    color: #c0c0c0 !important;
+    background: rgba(255, 255, 255, 0.08);
+    border-left: 2px solid rgba(255, 255, 255, 0.35);
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+    max-width: min(80%, 600px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-shadow: none !important;
+}
+.reply-prefix i, .reply-prefix small {
+    font-style: normal !important;
+    font-size: inherit !important;
+    font-weight: inherit !important;
+    color: inherit !important;
+}
+
+/* First-time chatter pill — same neutral palette as reply-prefix, hugs its
+   own text width (no full-row bar). The whole .message gets a green tint
+   to draw the eye; the pill stays subtle. */
+.first-chat-prefix {
+    display: block;
+    width: fit-content;
+    font-style: normal !important;
+    font-size: 16px;
+    line-height: 1.3;
+    font-weight: 600 !important;
+    color: #c0c0c0 !important;
+    background: rgba(255, 255, 255, 0.08);
+    border-left: 2px solid rgba(255, 255, 255, 0.35);
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    text-shadow: none !important;
+}
+.message.first-chat {
+    background: rgba(76, 209, 55, 0.18) !important;
+}
+
+/* Extras (Donations, Memberships) */
+.donation { display: inline !important; color: #4cd137; font-weight: 600; margin-left: 5px; }
+.membership-status { display: inline !important; color: #ffd700; font-weight: 700; font-size: 0.9em; margin-right: 5px; }
+.large-image { max-width: 100%; height: auto; margin-top: 5px; border-radius: 8px; display: block !important; }
+
+/* Shared-chat de-emphasis — applies to BOTH on-stream overlay AND dock.
+   The IRC enrichment layer adds .from-shared-channel to message divs whose
+   source-room-id !== host room-id (i.e. routed in from a partner channel).
+   Goal: host messages pop, collab messages recede a little.
+   --shared-opacity = text/name/donation alpha. Edge bar dims to match.
+   Indent shifts the whole message right so host chat hugs the left edge. */
+.message.from-shared-channel .text,
+.message.from-shared-channel .name,
+.message.from-shared-channel .name-bg,
+.message.from-shared-channel .donation,
+.message.from-shared-channel .shared-chat-icon {
+    opacity: var(--shared-opacity, 0.6);
+}
+.message.from-shared-channel::before {
+    opacity: var(--shared-opacity, 0.6);
+}
+.message.from-shared-channel .reply-prefix {
+    opacity: calc(var(--shared-opacity, 0.6) + 0.15);
+}
+.message.from-shared-channel {
+    margin-left: 14px !important;
+}
+
+/* Shared Chat Source Marker — applied by IRC enrichment (see &twitchchannel=) */
+.shared-chat-marker {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    margin-right: 8px;
+    line-height: 0;
+}
+.shared-chat-marker:empty {
+    display: none !important;
+}
+.shared-chat-icon {
+    display: block;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #ffd700;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+    flex-shrink: 0;
+}
+
+/* Keep developer's spacer logic intact */
+#spacer {
+    width: 100%;
+    padding: 0;
+    margin: 0;
+    border: none;
+    box-sizing: border-box;
+    background: transparent;
+    opacity: 1;
+    transform: none;
+    transition: none;
+}
+
+/* &scroll=true mode — natural mouse-wheel scrollable container */
+body.scroll-mode #chat-container {
+    overflow-y: auto !important;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.3) transparent;
+}
+body.scroll-mode #chat-container::-webkit-scrollbar { width: 8px; }
+body.scroll-mode #chat-container::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.3);
+    border-radius: 4px;
+}
+body.scroll-mode #chat-container::-webkit-scrollbar-track { background: transparent; }
+body.scroll-mode #message-list-wrapper {
+    transform: none !important;
+    transition: none !important;
+}
+body.scroll-mode #spacer { display: none !important; }
+/* Disable proximity fade in scroll mode — the user is reading, don't fade their view */
+body.scroll-mode .message {
+    --scroll-opacity: 1 !important;
+}
+
+/* Stats top bar — populated by SSN viewer_update events.
+   Hidden by default; shown only when isdock=true. */
+#stats-bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 28px;
+    background: transparent;
+    z-index: 1000;
+    padding: 0 10px;
+    display: none;
+    align-items: center;
+    gap: 8px;
+    font-family: 'Inter', sans-serif;
+    font-size: 12px;
+    color: #fff;
+    text-shadow: none;
+    box-sizing: border-box;
+}
+.stats-pill.stats-capture {
+    display: none;
+    margin-left: auto;
+    cursor: pointer;
+    border-left: 2px solid #ff5555;
+    user-select: none;
+}
+body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
+.stats-pill.stats-capture:hover { background: rgba(255, 85, 85, 0.18); }
+.stats-pill.stats-capture .cap-dot {
+    color: #ff5555;
+    font-weight: 700;
+    font-size: 10px;
+}
+.stats-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 4px;
+    line-height: 1;
+}
+.stats-icon {
+    width: 14px;
+    height: 14px;
+    display: block;
+}
+.stats-count {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+.stats-pill[data-platform="twitch"]  { border-left: 2px solid #9146FF; }
+.stats-pill[data-platform="youtube"] { border-left: 2px solid #FF0000; }
+.stats-pill[data-platform="tiktok"]  { border-left: 2px solid #69C9D0; }
+
+/* &debug=true banner */
+#debug-banner {
+    position: fixed;
+    top: 4px;
+    left: 4px;
+    z-index: 9999;
+    background: rgba(255, 0, 0, 0.85);
+    color: #fff;
+    padding: 4px 10px;
+    font-family: monospace;
+    font-size: 12px;
+    font-weight: 700;
+    border-radius: 4px;
+    text-shadow: none;
+    pointer-events: none;
+}
+</style></head>
+<body>
+<div id="stats-bar">
+    <span class="stats-pill" data-platform="twitch">
+        <img class="stats-icon" src="https://socialstream.ninja/sources/images/twitch.png" alt="Twitch">
+        <span class="stats-count">—</span>
+    </span>
+    <span class="stats-pill" data-platform="youtube">
+        <img class="stats-icon" src="https://socialstream.ninja/sources/images/youtube.png" alt="YouTube">
+        <span class="stats-count">—</span>
+    </span>
+    <span class="stats-pill" data-platform="tiktok">
+        <img class="stats-icon" src="https://socialstream.ninja/sources/images/tiktok.png" alt="TikTok">
+        <span class="stats-count">—</span>
+    </span>
+    <span class="stats-pill stats-capture" id="capture-toggle" title="Toggle capture panel">
+        <span class="cap-dot">●</span>
+        <span class="stats-count" id="capture-pill-count">0</span>
+    </span>
+</div>
+<div id="chat-container">
+    <div id="message-list-wrapper">
+		<div id="spacer" style="height: 2200px; width: 100%;"></div>
+    </div>
+</div>
+<script>
+    var urlParams = new URLSearchParams(window.location.search);
+    var roomID = "iWWnKL28tQ";
+    if (urlParams.has("session")) {
+        roomID = urlParams.get("session");
+    }
+    var password = "false";
+    var featuredMode = false;
+    var reversed = urlParams.has("reverse");
+    var scrollMode = urlParams.has("scroll") && urlParams.get("scroll") !== "false";
+    var debugMode = urlParams.has("debug") && urlParams.get("debug") !== "false";
+    var captureMode = urlParams.has("capture") && urlParams.get("capture") !== "false";
+
+    var twitchHostChannel = urlParams.has("twitchchannel")
+        ? urlParams.get("twitchchannel").toLowerCase().replace(/^#/, '').trim()
+        : null;
+    var collabChannels = urlParams.has("collabchannels")
+        ? urlParams.get("collabchannels").toLowerCase().split(",")
+            .map(s => s.trim().replace(/^#/, '')).filter(Boolean)
+        : [];
+
+    if (urlParams.has("bgalpha")) {
+        var bgAlpha = parseFloat(urlParams.get("bgalpha"));
+        if (!isNaN(bgAlpha) && bgAlpha >= 0 && bgAlpha <= 1) {
+            document.documentElement.style.setProperty('--message-bg-alpha', bgAlpha);
+        }
+    }
+
+    /* &sharedalpha=0.6 — opacity for messages routed in via Twitch shared chat
+       (see .from-shared-channel CSS). Default 0.6. Same value applies in both
+       on-stream overlay and OBS dock. */
+    if (urlParams.has("sharedalpha")) {
+        var sharedAlpha = parseFloat(urlParams.get("sharedalpha"));
+        if (!isNaN(sharedAlpha) && sharedAlpha >= 0 && sharedAlpha <= 1) {
+            document.documentElement.style.setProperty('--shared-opacity', sharedAlpha);
+        }
+    }
+
+    if (urlParams.has("fakestats") && urlParams.get("fakestats") !== "false") {
+        var fakes = { twitch: 20, youtube: 55, tiktok: 122 };
+        Object.keys(fakes).forEach(function (p) {
+            var pill = document.querySelector('.stats-pill[data-platform="' + p + '"] .stats-count');
+            if (pill) pill.textContent = fakes[p].toLocaleString();
+        });
+    }
+
+    if (scrollMode) document.body.classList.add('scroll-mode');
+    if (debugMode) {
+        const banner = document.createElement('div');
+        banner.id = 'debug-banner';
+        banner.textContent = 'DEBUG — open DevTools console';
+        document.body.appendChild(banner);
+        console.log('[overlay-debug] enabled. Logging every incoming SSN message payload.');
+    }
+
+    // ============================================================
+    // CAPTURE MODE — Phase 1 discovery for activity-feed dock
+    // ============================================================
+    // Why: SSN docs are incomplete on event payload shapes per platform.
+    // Before building a normalizer or any UI, we need ground-truth samples
+    // of EVERY non-chat event SSN actually emits in production (subs, bits,
+    // raids, follows, super-chats, TikTok likes/joins/shares, donations).
+    // This block hooks BOTH inbound paths (iframe postMessage + WebSocket)
+    // upstream of addMessageToOverlay so we record the raw payload before
+    // any filtering or rendering. Chat is captured too (kind='chat') so we
+    // can correlate timing — filter post-hoc in the JSON.
+    var captureBuffer = [];
+    var captureCounters = {
+        total: 0,
+        byPlatform: {},
+        byEvent: {},
+        byKind: { chat: 0, event: 0 }
+    };
+    var captureSessionStart = Date.now();
+    var captureStorageKey = 'ssn_capture_' + captureSessionStart;
+    var capturePanelEl = null;
+    var captureDirty = false;
+    var CAPTURE_MAX_ENTRIES = 10000;
+
+    function captureClassifyKind(p) {
+        if (!p || typeof p !== 'object') return 'event';
+        if (p.event) return 'event';
+        if (p.hasDonation || p.donation) return 'event';
+        if (p.membership) return 'event';
+        if (p.chatmessage) return 'chat';
+        if (p.chatname) return 'event'; // user with no message = follow / sub / etc
+        return 'event';
+    }
+
+    function captureEvent(source, payload) {
+        if (!captureMode || !payload) return;
+        try {
+            var clone = JSON.parse(JSON.stringify(payload));
+            var kind = captureClassifyKind(clone);
+            var platform = (clone.type || 'unknown').toLowerCase();
+            var eventType = clone.event
+                || (clone.hasDonation || clone.donation ? 'donation' : (kind === 'chat' ? 'chat' : 'unknown'));
+            captureBuffer.push({
+                ts: Date.now(),
+                iso: new Date().toISOString(),
+                source: source,
+                kind: kind,
+                platform: platform,
+                eventType: eventType,
+                payload: clone
+            });
+            if (captureBuffer.length > CAPTURE_MAX_ENTRIES) captureBuffer.shift();
+            captureCounters.total++;
+            captureCounters.byPlatform[platform] = (captureCounters.byPlatform[platform] || 0) + 1;
+            captureCounters.byEvent[eventType] = (captureCounters.byEvent[eventType] || 0) + 1;
+            captureCounters.byKind[kind]++;
+            captureDirty = true;
+        } catch (e) {
+            console.warn('[capture] failed to clone payload', e, payload);
+        }
+    }
+
+    function captureBuildBlob() {
+        return JSON.stringify({
+            session: {
+                started: new Date(captureSessionStart).toISOString(),
+                ended: new Date().toISOString(),
+                url: location.href,
+                ssnSession: roomID,
+                userAgent: navigator.userAgent
+            },
+            counters: captureCounters,
+            events: captureBuffer
+        }, null, 2);
+    }
+
+    function captureDownload() {
+        var json = captureBuildBlob();
+        var filename = 'ssn-capture-' + new Date(captureSessionStart).toISOString().replace(/[:.]/g, '-') + '.json';
+        var btn = capturePanelEl && capturePanelEl.querySelector('[data-act="download"]');
+        var origLabel = btn && btn.textContent;
+        function flash(label, ms) {
+            if (!btn) return;
+            btn.textContent = label;
+            setTimeout(function () { btn.textContent = origLabel || 'Download'; }, ms || 1800);
+        }
+
+        /* OBS browser source (CEF) silently no-ops anchor downloads — the click
+           fires but no file appears. Detect OBS via window.obsstudio and route
+           to clipboard instead; user pastes into a .json file. */
+        var isOBS = typeof window.obsstudio !== 'undefined';
+        if (isOBS) {
+            copyJsonToClipboard(json, flash);
+            return;
+        }
+
+        /* Path 1: File System Access API (Chromium-based regular browsers).
+           Pops a real save dialog so user picks the location explicitly.
+           Not available in OBS browser source (CEF) or non-secure contexts. */
+        if (window.showSaveFilePicker) {
+            (async function () {
+                try {
+                    var handle = await window.showSaveFilePicker({
+                        suggestedName: filename,
+                        types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }]
+                    });
+                    var w = await handle.createWritable();
+                    await w.write(json); await w.close();
+                    flash('✓ saved');
+                } catch (e) {
+                    if (e && e.name === 'AbortError') { flash('cancelled'); return; }
+                    console.warn('[capture] showSaveFilePicker failed, falling back:', e);
+                    legacyDownload();
+                }
+            })();
+            return;
+        }
+        legacyDownload();
+
+        function legacyDownload() {
+            try {
+                var blob = new Blob([json], { type: 'application/json' });
+                var url = URL.createObjectURL(blob);
+                var a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                a.rel = 'noopener';
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
+                flash('✓ downloaded — check Downloads folder');
+                console.log('[capture] download triggered →', filename);
+            } catch (e) {
+                /* Path 3: open the blob URL in a new tab so user can Ctrl+S manually.
+                   Last resort for sandboxed contexts (e.g. OBS browser source). */
+                console.warn('[capture] anchor download blocked, opening in new tab:', e);
+                try {
+                    var blob2 = new Blob([json], { type: 'application/json' });
+                    var url2 = URL.createObjectURL(blob2);
+                    var w = window.open(url2, '_blank');
+                    if (!w) {
+                        flash('blocked — see console');
+                        console.error('[capture] new tab blocked too. Run window.__ssn_capture.download() from a regular browser tab.');
+                    } else {
+                        flash('opened in new tab — Ctrl+S there');
+                    }
+                } catch (e2) {
+                    flash('failed — see console');
+                    console.error('[capture] all download paths failed:', e2);
+                }
+            }
+        }
+    }
+
+    /* Clipboard fallback for OBS browser source. Tries async API first, then
+       legacy textarea + execCommand('copy') for sandboxed contexts. */
+    function copyJsonToClipboard(json, flash) {
+        function fallbackTextarea() {
+            try {
+                var ta = document.createElement('textarea');
+                ta.value = json;
+                ta.style.cssText = 'position:fixed;top:-9999px;opacity:0;';
+                document.body.appendChild(ta);
+                ta.focus(); ta.select();
+                var ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                if (ok) {
+                    flash('✓ copied (' + json.length + ' chars)');
+                    console.log('[capture] copied JSON to clipboard (textarea fallback) —', json.length, 'chars. Paste into a .json file.');
+                } else {
+                    flash('copy failed');
+                    console.error('[capture] execCommand copy returned false. JSON in window.__ssn_capture_lastDump');
+                    window.__ssn_capture_lastDump = json;
+                }
+            } catch (e) {
+                flash('failed — see console');
+                console.error('[capture] textarea fallback failed:', e);
+                window.__ssn_capture_lastDump = json;
+            }
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(json).then(function () {
+                flash('✓ copied (' + json.length + ' chars)');
+                console.log('[capture] copied JSON to clipboard —', json.length, 'chars. Paste into a .json file.');
+            }).catch(function (e) {
+                console.warn('[capture] navigator.clipboard failed, trying textarea:', e && e.message || e);
+                fallbackTextarea();
+            });
+        } else {
+            fallbackTextarea();
+        }
+    }
+
+    function captureClear() {
+        if (!confirm('Clear capture buffer? (' + captureCounters.total + ' events)')) return;
+        captureBuffer.length = 0;
+        captureCounters = { total: 0, byPlatform: {}, byEvent: {}, byKind: { chat: 0, event: 0 } };
+        try { localStorage.removeItem(captureStorageKey); } catch (e) {}
+        captureSessionStart = Date.now();
+        captureStorageKey = 'ssn_capture_' + captureSessionStart;
+        captureDirty = true;
+        captureRenderPanel();
+    }
+
+    function captureRenderPanel() {
+        if (!capturePanelEl) return;
+        var bodyEl = capturePanelEl.querySelector('.cap-body');
+        if (!bodyEl) return;
+        var rows = [];
+        var pillCount = document.getElementById('capture-pill-count');
+        if (pillCount) pillCount.textContent = captureCounters.total;
+        rows.push('<div class="cap-row cap-total">total: ' + captureCounters.total + '</div>');
+        rows.push('<div class="cap-row cap-kind">chat: ' + captureCounters.byKind.chat + ' &nbsp; event: ' + captureCounters.byKind.event + '</div>');
+        rows.push('<div class="cap-section">platforms</div>');
+        Object.keys(captureCounters.byPlatform).sort().forEach(function (p) {
+            rows.push('<div class="cap-row">' + p + ': ' + captureCounters.byPlatform[p] + '</div>');
+        });
+        rows.push('<div class="cap-section">events</div>');
+        Object.keys(captureCounters.byEvent).sort().forEach(function (e) {
+            rows.push('<div class="cap-row">' + e + ': ' + captureCounters.byEvent[e] + '</div>');
+        });
+        bodyEl.innerHTML = rows.join('');
+    }
+
+    function captureSetupPanel() {
+        var styleEl = document.createElement('style');
+        styleEl.textContent = ''
+            + '#capture-panel { display: none; position: fixed; top: 36px; right: 8px; z-index: 999999;'
+            + ' width: 220px; max-height: 80vh; overflow: auto;'
+            + ' background: rgba(20,20,30,0.92); color: #e0e0e0;'
+            + ' font: 11px/1.4 Consolas, Monaco, monospace;'
+            + ' border: 1px solid #ff5555; border-radius: 6px;'
+            + ' padding: 6px 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.6);'
+            + ' text-shadow: none; }'
+            + '#capture-panel.cap-open { display: block; }'
+            + '#capture-panel.cap-hidden .cap-body, #capture-panel.cap-hidden .cap-buttons { display: none; }'
+            + '#capture-panel.cap-hidden { width: auto; }'
+            + '#capture-panel .cap-header { display: flex; justify-content: space-between; align-items: center;'
+            + ' font-weight: bold; color: #ff5555; margin-bottom: 4px; cursor: pointer; user-select: none; }'
+            + '#capture-panel .cap-row { padding: 1px 0; }'
+            + '#capture-panel .cap-total { font-weight: bold; color: #ffdd55; }'
+            + '#capture-panel .cap-kind { color: #aaccff; margin-bottom: 4px; }'
+            + '#capture-panel .cap-section { margin-top: 6px; padding-top: 4px; border-top: 1px solid #444;'
+            + ' color: #888; text-transform: uppercase; font-size: 9px; }'
+            + '#capture-panel .cap-buttons { margin-top: 8px; display: flex; gap: 4px; flex-wrap: wrap; }'
+            + '#capture-panel button { flex: 1; min-width: 60px;'
+            + ' background: #333; color: #eee; border: 1px solid #555;'
+            + ' padding: 4px 6px; cursor: pointer; font: 10px monospace; border-radius: 3px; }'
+            + '#capture-panel button:hover { background: #444; }'
+            + '#capture-panel button.cap-dl { background: #2a4a2a; border-color: #4a7a4a; }'
+            + '#capture-panel button.cap-dl:hover { background: #3a6a3a; }';
+        document.head.appendChild(styleEl);
+
+        capturePanelEl = document.createElement('div');
+        capturePanelEl.id = 'capture-panel';
+        capturePanelEl.innerHTML = ''
+            + '<div class="cap-header" title="click to collapse">'
+            +     '<span>CAPTURE ●</span>'
+            +     '<span class="cap-toggle">[hide]</span>'
+            + '</div>'
+            + '<div class="cap-body"></div>'
+            + '<div class="cap-buttons">'
+            +     '<button class="cap-dl" data-act="download">Download</button>'
+            +     '<button data-act="clear">Clear</button>'
+            + '</div>';
+        document.body.appendChild(capturePanelEl);
+
+        // Header click closes the panel (the [hide] indicator).
+        capturePanelEl.querySelector('.cap-header').addEventListener('click', function () {
+            capturePanelEl.classList.remove('cap-open');
+        });
+        capturePanelEl.querySelector('[data-act="download"]').addEventListener('click', captureDownload);
+        capturePanelEl.querySelector('[data-act="clear"]').addEventListener('click', captureClear);
+
+        // Panel defaults to closed (CSS display:none). Pill in stats bar is the entry point.
+        document.body.classList.add('cap-enabled');
+        var capPill = document.getElementById('capture-toggle');
+        if (capPill) {
+            capPill.addEventListener('click', function () {
+                capturePanelEl.classList.toggle('cap-open');
+            });
+        }
+
+        // Throttled UI updates so high-volume TikTok bursts don't churn DOM
+        setInterval(function () {
+            if (captureDirty) {
+                captureDirty = false;
+                captureRenderPanel();
+            }
+        }, 250);
+
+        // Auto-save every 5s as a crash net (browser crash, OBS restart, etc.)
+        setInterval(function () {
+            if (captureBuffer.length === 0) return;
+            try {
+                localStorage.setItem(captureStorageKey, captureBuildBlob());
+            } catch (e) {
+                console.warn('[capture] localStorage save failed (likely full):', e.message);
+            }
+        }, 5000);
+
+        window.__ssn_capture = {
+            events: function () { return captureBuffer; },
+            counters: function () { return captureCounters; },
+            download: captureDownload,
+            clear: captureClear,
+            summary: function () {
+                console.log('total:', captureCounters.total);
+                console.log('by kind:', captureCounters.byKind);
+                console.table(captureCounters.byPlatform);
+                console.table(captureCounters.byEvent);
+            }
+        };
+
+        captureRenderPanel();
+        console.log('[capture] mode active. window.__ssn_capture available.');
+        console.log('[capture] auto-saving every 5s to localStorage key:', captureStorageKey);
+        console.log('[capture] NOTE: ensure SSN extension has "send events" / "send system messages" enabled.');
+    }
+
+    if (captureMode) {
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', captureSetupPanel);
+        } else {
+            captureSetupPanel();
+        }
+    }
+
+    // Auto-stick-to-bottom tracking for scroll mode
+    var stickToBottom = true;
+    var SCROLL_STICK_THRESHOLD_PX = 40;
+
+    // Channels you own (comma-separated, case-insensitive). Messages whose sourceName
+    // doesn't match any of these get a "shared chat" marker.
+    // Example: ?mychannel=thepolishdane,thepolishdane_yt
+    var myChannels = urlParams.has("mychannel")
+        ? urlParams.get("mychannel").toLowerCase().split(",").map(s => s.trim()).filter(Boolean)
+        : [];
+
+    const chatContainer = document.getElementById('chat-container');
+    const messageListWrapper = document.getElementById('message-list-wrapper');
+    const MAX_MESSAGES = urlParams.has("limit") ? parseInt(urlParams.get("limit")) : 20; // Adjust as needed
+    const showtime = urlParams.has("showtime") ? parseInt(urlParams.get("showtime")) : 30000;
+    const topSpacer = document.getElementById('spacer');
+
+    // In reverse mode, hide the spacer and position container at top
+    if (reversed) {
+        topSpacer.style.display = 'none';
+        chatContainer.style.bottom = 'auto';
+        chatContainer.style.top = '0';
+        chatContainer.classList.add('reverse-mode');
+    }
+	const messageTimestamps = new Map();
+    const MAX_SPACER_HEIGHT_BEFORE_RESET = 18000000; 
+    const PROXIMITY_FADE_DISTANCE = (() => {
+        if (urlParams.has("fadezone")) {
+            const parsed = parseInt(urlParams.get("fadezone"), 10);
+            if (!Number.isNaN(parsed) && parsed >= 0) {
+                return parsed;
+            }
+        }
+        return 160; // Pixels before reaching top where fade begins
+    })();
+
+    // Gradually fade out each message as it approaches the edge of the chat container.
+    // In normal mode, fades at top edge. In reverse mode, fades at bottom edge.
+    function updateProximityFade() {
+        const messages = Array.from(messageListWrapper.children).filter(
+            child => child.id !== 'spacer' && child.classList.contains('message')
+        );
+
+        if (messages.length === 0) {
+            requestAnimationFrame(updateProximityFade);
+            return;
+        }
+
+        const containerRect = chatContainer.getBoundingClientRect();
+        const fadeDistance = PROXIMITY_FADE_DISTANCE;
+
+        messages.forEach(message => {
+            if (!message.isConnected) {
+                return;
+            }
+            if (fadeDistance <= 0) {
+                if (message.style.getPropertyValue('--scroll-opacity') !== '1') {
+                    message.style.removeProperty('--scroll-opacity');
+                }
+                message.classList.remove('proximity-fading');
+                delete message.dataset.proximityFadeStarted;
+                return;
+            }
+
+            const rect = message.getBoundingClientRect();
+            // In reverse mode, measure distance from bottom edge; otherwise from top
+            const distanceFromEdge = reversed
+                ? (containerRect.bottom - rect.bottom)
+                : (rect.top - containerRect.top);
+            const fadeStarted = message.dataset.proximityFadeStarted === 'true';
+
+            if (distanceFromEdge <= fadeDistance) {
+                if (!fadeStarted) {
+                    message.dataset.proximityFadeStarted = 'true';
+                    message.classList.add('proximity-fading');
+                    message.style.setProperty('--scroll-opacity', '0');
+                }
+                return;
+            }
+
+            if (!fadeStarted) {
+                if (message.classList.contains('proximity-fading')) {
+                    message.classList.remove('proximity-fading');
+                }
+                message.style.removeProperty('--scroll-opacity');
+            }
+        });
+
+        requestAnimationFrame(updateProximityFade);
+    }
+
+    requestAnimationFrame(updateProximityFade);
+
+    function adjustMessageWrapperScroll() {
+        if (reversed) return; // No transform needed in reverse mode
+        if (scrollMode) {
+            // Native scroll: pin to bottom only if user hasn't scrolled away
+            requestAnimationFrame(() => {
+                if (stickToBottom) {
+                    chatContainer.scrollTop = chatContainer.scrollHeight;
+                }
+            });
+            return;
+        }
+        requestAnimationFrame(() => {
+            const wrapperScrollHeight = messageListWrapper.scrollHeight;
+            const containerClientHeight = chatContainer.clientHeight;
+
+            let translateY = 0;
+            if (wrapperScrollHeight > containerClientHeight) {
+                translateY = -(wrapperScrollHeight - containerClientHeight);
+            }
+            translateY = Math.min(0, translateY);
+
+            messageListWrapper.style.transform = `translateY(${translateY}px)`;
+        });
+    }
+
+    if (scrollMode) {
+        chatContainer.addEventListener('scroll', () => {
+            const distanceFromBottom = chatContainer.scrollHeight
+                - chatContainer.scrollTop - chatContainer.clientHeight;
+            stickToBottom = distanceFromBottom <= SCROLL_STICK_THRESHOLD_PX;
+        }, { passive: true });
+    }
+    
+	setInterval(() => {
+		const now = Date.now();
+		const messages = Array.from(messageListWrapper.children).filter(
+			child => child.id !== 'spacer' && child.classList.contains('message')
+		);
+		
+		messages.forEach(message => {
+			const timestamp = messageTimestamps.get(message.id);
+			if (timestamp) {
+				const age = now - timestamp;
+				
+				if (showtime > 0 && age > showtime && !message.classList.contains('fading')) {
+					message.classList.add('fading');
+				}
+			}
+		});
+	}, 1000); 
+	
+    function setPlatformPill(platform, count) {
+        var pill = document.querySelector('.stats-pill[data-platform="' + platform + '"] .stats-count');
+        if (!pill) return;
+        if (typeof count !== 'number') count = parseInt(count, 10);
+        if (isNaN(count) || count < 0) { pill.textContent = '—'; }
+        else { pill.textContent = count.toLocaleString(); }
+        if (debugMode) console.log('[overlay-stats]', platform, count);
+    }
+
+    /* SSN sends `viewer_updates` (plural) with `meta: { twitch: N, youtube: N, tiktok: N }`.
+       Older docs / single-platform builds may also emit `viewer_update` (singular) with
+       `data.type` + flat `data.meta` int. Handle both. Verified via 2026-05-06 capture. */
+    function handleViewerUpdate(data) {
+        if (data.meta && typeof data.meta === 'object' && !Array.isArray(data.meta)) {
+            Object.keys(data.meta).forEach(function (plat) {
+                setPlatformPill(plat.toLowerCase(), data.meta[plat]);
+            });
+            return;
+        }
+        var platform = (data.type || '').toLowerCase();
+        if (!platform) return;
+        setPlatformPill(platform, data.meta);
+    }
+
+    function addMessageToOverlay(data) {
+		if (debugMode) {
+			try {
+				console.log('[overlay-debug]', JSON.parse(JSON.stringify(data)));
+			} catch (e) {
+				console.log('[overlay-debug] (raw)', data);
+			}
+		}
+
+		// Intercept viewer-count / stats events before the chat filter.
+		// SSN emits 'viewer_updates' (plural) with meta object {twitch:N, youtube:N, tiktok:N};
+		// older builds use 'viewer_update' (singular) with data.type + flat meta int.
+		if (data.event === 'viewer_updates' || data.event === 'viewer_update' || data.event === 'viewers') {
+			handleViewerUpdate(data);
+			return;
+		}
+
+		// Activity events (subs, gifts, donations, follows, raids, highlights, deletions)
+		// belong in the activity-feed dock, not the chat overlay. Plain chat messages
+		// have data.event === '' (Twitch shared chat) or undefined (YT/Discord/Facebook/etc).
+		// Anything with a truthy event marker is a non-chat event — drop it.
+		if (data.event) return;
+		if (data.delete) return;
+
+		if (!data.chatname && !data.chatmessage && !data.hasDonation && !data.donation && !data.contentimg){
+			return;
+		}
+		
+		const messageDiv = document.createElement('div');
+		messageDiv.classList.add('message');
+		
+		// Generate unique ID and track timestamp for aging
+		const messageId = data.mid || 'msg-' + Date.now();
+		messageDiv.id = messageId;
+		messageTimestamps.set(messageId, Date.now());
+
+		// Shared-chat marker is applied LATER by the IRC enrichment layer
+		// (see setupTwitchIRC at bottom of script). We render an empty
+		// placeholder span here so the IRC matcher has a known insertion point.
+		const sharedChatHtml = data.type === 'twitch'
+			? '<span class="shared-chat-marker" data-shared-marker-slot="1"></span>'
+			: '';
+
+		var chatbadgesHtml = "";
+		if (data.chatbadges) {
+			data.chatbadges.forEach(badge => {
+				if (typeof badge === "object") {
+					if (badge.type === "img" && badge.src) {
+						chatbadgesHtml += `<img class='badge' src='${badge.src}' alt='badge'>`;
+					} else if (badge.type === "svg" && badge.html) {
+						chatbadgesHtml += `<span class='badge svg'>${badge.html}</span>`;
+					}
+				} else { 
+					chatbadgesHtml += `<img class='badge' src='${badge}' alt='badge'>`;
+				}
+			});
+		}
+		
+		let avatarBorderColor = "linear-gradient(45deg, #4ab8f9, #4cd137)"; // Default gradient
+		if (data.nameColor) {
+			avatarBorderColor = `linear-gradient(45deg, ${data.nameColor}, ${data.nameColor}88)`;
+		}
+		
+		/* Manual platform color map — checked BEFORE SSN's getColorFromType because
+		   that function throws for unknown types like 'spotify' (the !queue bot).
+		   See colorseed TypeError that used to spam the console. */
+		var PLATFORM_COLORS = {
+			twitch:  '#9146FF', // Twitch Purple
+			youtube: '#FF0000', // YouTube Red
+			tiktok:  '#333333', // Dark grey (don't use pure black, vanishes into shadow)
+			spotify: '#1DB954'  // Spotify Green — for !queue bot etc.
+		};
+		var leftEdgeColor = null;
+		if (data.type && PLATFORM_COLORS[data.type]) {
+			leftEdgeColor = PLATFORM_COLORS[data.type];
+		} else if (typeof getColorFromType === 'function' && data.type) {
+			try {
+				leftEdgeColor = getColorFromType(data.type);
+			} catch (e) {
+				console.warn('[overlay] getColorFromType threw for type=' + data.type + ' — rendering without edge color');
+			}
+		}
+		
+		if (leftEdgeColor) {
+			// Pass the color to our custom CSS line instead of making a full border
+			messageDiv.style.setProperty('--edge-color', leftEdgeColor);
+		}
+		
+		const sourceIconHtml = data.type ? `<img src="https://socialstream.ninja/sources/images/${data.type}.png" alt="Source" class="source-icon">` : '';
+		const avatarHtml = data.chatimg ? 
+			`<div class="avatar-wrapper" style="background: ${avatarBorderColor}"><div class="avatar" style="background-image: url('${data.chatimg}');"></div></div>` : '';
+		const nameHtml = data.chatname ? `<div class="name-bg"><div class="name" ${data.nameColor ? `style="color: ${data.nameColor} !important;"` : ''}>${data.chatname}</div></div>` : '';
+		const membershipHtml = data.membership ? `<div class="membership-status">${data.membership}</div>` : '';
+		// Split out SSN's leading reply-quote block: <i><small>...</small></i>
+		// so we can render it on its own line above the username row.
+		let chatmessageMain = data.chatmessage || '';
+		let replyPrefixHtml = '';
+		const replyMatch = chatmessageMain.match(/^(<i><small>[\s\S]*?<\/small><\/i>)\s*/);
+		if (replyMatch) {
+			replyPrefixHtml = replyMatch[1];
+			chatmessageMain = chatmessageMain.substring(replyMatch[0].length);
+		}
+		const messageTextHtml = `<div class="text" ${data.event ? 'style="font-style: italic;"' : ''}>${chatmessageMain}</div>`;
+		const replyPrefixDiv = replyPrefixHtml ? `<div class="reply-prefix">${replyPrefixHtml}</div>` : '';
+		const firstChatDiv = data.firsttime === true ? `<div class="first-chat-prefix">new chatter</div>` : '';
+		if (data.firsttime === true) messageDiv.classList.add('first-chat');
+		const donationHtml = data.hasDonation ? `<div class="donation">${data.hasDonation}</div>` : '';
+		
+		const contentImgHtml = data.contentimg ? 
+			`<div style="padding: 3px; border-radius: 12px; background: ${avatarBorderColor}; display: inline-block; margin-top: 10px;">
+				<img src="${data.contentimg}" alt="Content Image" class="large-image" style="margin-top: 0; border-radius: 8px;" onerror="this.parentNode.style.display='none';">
+			 </div>` : '';
+
+		messageDiv.innerHTML = `
+			${firstChatDiv}
+			${replyPrefixDiv}
+			<div class="message-content-wrapper">
+				${avatarHtml}
+				<div class="message-text-meta">
+					<div>
+						${sharedChatHtml}
+						${sourceIconHtml}
+						${chatbadgesHtml}
+						${nameHtml}
+					</div>
+					${messageTextHtml}
+					${donationHtml}
+				</div>
+			</div>
+			${contentImgHtml}
+		`;
+
+		if (reversed) {
+			// In reverse mode, insert new messages at the top (after spacer if present)
+			const firstMessage = messageListWrapper.querySelector('.message');
+			if (firstMessage) {
+				messageListWrapper.insertBefore(messageDiv, firstMessage);
+			} else {
+				messageListWrapper.appendChild(messageDiv);
+			}
+		} else {
+			messageListWrapper.appendChild(messageDiv);
+		}
+		void messageDiv.offsetWidth;
+		messageDiv.classList.add('visible');
+
+		// IRC enrichment hook — register pending Twitch messages or apply marker
+		// immediately if IRC has already cached a matching PRIVMSG.
+		if (data.type === 'twitch' && twitchHostChannel) {
+			handleTwitchMessageForEnrichment(messageDiv, data);
+		}
+
+		const messages = Array.from(messageListWrapper.children).filter(
+			child => child.id !== 'spacer' && child.classList.contains('message')
+		);
+		
+		if (messages.length > MAX_MESSAGES) {
+			// In reverse mode, oldest messages are at the bottom (end of array)
+			const oldestMessage = reversed ? messages[messages.length - 1] : messages[0];
+
+			if (oldestMessage) {
+				if (!reversed && !scrollMode) {
+					const messageStyle = getComputedStyle(oldestMessage);
+					const marginBottom = parseFloat(messageStyle.marginBottom) || 0;
+					const spaceOccupiedByOldestMessage = oldestMessage.offsetHeight + marginBottom;
+
+					const currentSpacerHeight = parseFloat(topSpacer.style.height) || 0;
+					let newPotentialSpacerHeight = currentSpacerHeight + spaceOccupiedByOldestMessage;
+
+					if (newPotentialSpacerHeight > MAX_SPACER_HEIGHT_BEFORE_RESET) {
+						console.log(`Spacer height (${newPotentialSpacerHeight}px) exceeded threshold (${MAX_SPACER_HEIGHT_BEFORE_RESET}px). Resetting to 0px.`);
+						newPotentialSpacerHeight = 0; // Reset the height
+					}
+
+					topSpacer.style.height = newPotentialSpacerHeight + 'px';
+				}
+
+				messageTimestamps.delete(oldestMessage.id);
+				messageListWrapper.removeChild(oldestMessage);
+			}
+		}
+		
+		adjustMessageWrapperScroll();
+	}
+
+    var iframe = document.createElement("iframe");
+    if (featuredMode){
+        iframe.src = `https://vdo.socialstream.ninja/?ln&password=${password}&salt=vdo.ninja&label=overlay&exclude=${roomID}&scene&novideo&noaudio&cleanoutput&room=${roomID}`;
+    } else {
+        iframe.src = "https://vdo.socialstream.ninja/?ln&salt=vdo.ninja&password="+password+"&push&label=dock&vd=0&ad=0&novideo&noaudio&autostart&cleanoutput&room="+roomID; 
+    }
+    iframe.style.cssText = "width: 0px; height: 0px; position: fixed; left: -100px; top: -100px;";
+    document.body.appendChild(iframe);
+    window.addEventListener("message", function (e) {
+        if (e.source != iframe.contentWindow) return;
+        if (e.data.dataReceived && e.data.dataReceived.overlayNinja) {
+            captureEvent('iframe', e.data.dataReceived.overlayNinja);
+            addMessageToOverlay(e.data.dataReceived.overlayNinja);
+        }
+    });
+    
+    var conCon = 1;
+    var socketserver = false;
+    var serverURL = urlParams.has("localserver") ? "ws://127.0.0.1:3000" : "wss://io.socialstream.ninja";
+
+    function setupSocket(){
+        socketserver.onclose = function (){
+            setTimeout(function(){
+                conCon+=1;
+                socketserver = new WebSocket(serverURL);
+                setupSocket();
+            },100*conCon);
+        };
+        socketserver.onopen = function (){
+            conCon = 1;
+            socketserver.send(JSON.stringify({"join":roomID, "out":3, "in":4}));
+        };
+        socketserver.addEventListener('message', function (event) {
+            if (event.data){
+                try {
+                    var data = JSON.parse(event.data);
+                    if (data) {
+                        captureEvent('websocket', data);
+                        addMessageToOverlay(data);
+                    }
+                } catch (error) {
+                    console.error("Error processing WebSocket message:", error, "Data:", event.data);
+                }
+            }
+        });
+    }
+    
+    if (urlParams.has("server") || urlParams.has("server2")){
+        serverURL = urlParams.get("server") ||  urlParams.get("server2") || serverURL;
+        socketserver = new WebSocket(serverURL);
+        setupSocket();
+    }
+
+// --- CUSTOM DOCK MODE OVERRIDE ---
+    // If we add &isdock=true to the URL, apply these changes:
+    if (urlParams.has("isdock") && urlParams.get("isdock") === "true") {
+        
+        // 1. Change the background to dark gray & shrink text
+        document.body.style.setProperty("background-color", "#18181b", "important"); 
+        document.body.style.setProperty("font-size", "16px", "important");
+        document.body.style.setProperty("text-shadow", "none", "important");
+
+        // 2. Inject CSS to unhide badges and scale them
+        const dockStyles = document.createElement('style');
+        dockStyles.innerHTML = `
+            .source-icon, .badge, .membership-status { display: inline-block !important; }
+            .source-icon, .badge { width: 18px !important; height: 18px !important; vertical-align: middle !important; margin-right: 4px !important; }
+            .text img { max-height: 24px !important; }
+            .shared-chat-icon { width: 10px !important; height: 10px !important; box-shadow: 0 1px 1px rgba(0,0,0,0.5) !important; }
+            .shared-chat-marker { margin-right: 5px !important; }
+            .reply-prefix { font-size: 11px !important; max-width: 220px !important; padding: 1px 5px !important; margin-bottom: 2px !important; }
+            .first-chat-prefix { font-size: 10px !important; padding: 1px 5px !important; margin-bottom: 2px !important; }
+            #stats-bar { display: flex !important; }
+            #chat-container { top: 28px !important; height: calc(100vh - 28px) !important; bottom: 0 !important; }
+        `;
+        document.head.appendChild(dockStyles);
+    }
+
+    // ============================================================
+    // TWITCH IRC ENRICHMENT — Shared Chat origin detection
+    // ============================================================
+    // Why: SSN does not surface source-room-id / source-id / source-badges.
+    // We open an anonymous Twitch IRC WebSocket, JOIN the host + collab
+    // channels, capture per-PRIVMSG tags, then match incoming SSN messages
+    // by chatname (case-insensitive) within a 5s window.
+    // No auth needed — justinfan login is read-only and rate-limit friendly.
+
+    var ircRoomIdToName = new Map();   // "12345" -> "ironmouse"
+    var ircHostRoomId = null;          // populated from ROOMSTATE
+    var ircCacheByName = new Map();    // chatnameLower -> [{tags, ts, expiresAt}]
+    var ircPendingByName = new Map();  // chatnameLower -> [{messageDiv, ts}]
+    var IRC_MATCH_WINDOW_MS = 5000;
+    var IRC_CACHE_TTL_MS = 30000;
+
+    function ircDebug() {
+        if (debugMode) console.log.apply(console, ['[overlay-irc]'].concat([].slice.call(arguments)));
+    }
+
+    function parseIrcLine(line) {
+        // @tags :prefix COMMAND params... :trailing
+        var pos = 0;
+        var tags = {};
+        if (line[pos] === '@') {
+            var tagEnd = line.indexOf(' ', pos);
+            if (tagEnd === -1) return null;
+            line.substring(1, tagEnd).split(';').forEach(function (pair) {
+                var eq = pair.indexOf('=');
+                if (eq === -1) tags[pair] = '';
+                else tags[pair.substring(0, eq)] = pair.substring(eq + 1);
+            });
+            pos = tagEnd + 1;
+        }
+        var prefix = '';
+        if (line[pos] === ':') {
+            var prefixEnd = line.indexOf(' ', pos);
+            if (prefixEnd === -1) return null;
+            prefix = line.substring(pos + 1, prefixEnd);
+            pos = prefixEnd + 1;
+        }
+        var rest = line.substring(pos);
+        var trailing = null;
+        var trailIdx = rest.indexOf(' :');
+        if (trailIdx !== -1) {
+            trailing = rest.substring(trailIdx + 2);
+            rest = rest.substring(0, trailIdx);
+        } else if (rest[0] === ':') {
+            trailing = rest.substring(1);
+            rest = '';
+        }
+        var parts = rest.length ? rest.split(' ') : [];
+        return {
+            tags: tags,
+            prefix: prefix,
+            command: parts[0] || '',
+            params: parts.slice(1),
+            trailing: trailing
+        };
+    }
+
+    function applySharedChatMarker(messageDiv, tags) {
+        if (!messageDiv || !messageDiv.isConnected) return;
+        var sourceRoomId = tags['source-room-id'];
+        var msgRoomId = tags['room-id'];
+        if (!sourceRoomId) return;
+        if (sourceRoomId === msgRoomId) return; // not shared, message originated here
+
+        // Resolve source channel name + pfp
+        var sourceChannelName = ircRoomIdToName.get(sourceRoomId) || null;
+        var slot = messageDiv.querySelector('[data-shared-marker-slot]');
+        if (!slot) return;
+        if (slot.dataset.sharedMarkerApplied === '1') return; // idempotent
+        slot.dataset.sharedMarkerApplied = '1';
+
+        var label = sourceChannelName ? "Shared chat — from " + sourceChannelName
+                                      : "Shared chat";
+        slot.innerHTML = '<span class="shared-chat-icon" aria-hidden="true"></span>';
+        slot.title = label;
+        messageDiv.classList.add('from-shared-channel');
+        ircDebug('marker applied', { from: sourceChannelName || sourceRoomId, msgId: messageDiv.id });
+    }
+
+    function handleTwitchMessageForEnrichment(messageDiv, data) {
+        var name = (data.chatname || '').toString().toLowerCase().trim();
+        if (!name) return;
+        var now = Date.now();
+
+        // Look for already-arrived IRC PRIVMSG cached for this user
+        var cached = ircCacheByName.get(name);
+        if (cached && cached.length) {
+            // Find one within the match window, prefer most recent
+            for (var i = cached.length - 1; i >= 0; i--) {
+                if (Math.abs(cached[i].ts - now) < IRC_MATCH_WINDOW_MS
+                    || (now - cached[i].ts) < IRC_MATCH_WINDOW_MS) {
+                    applySharedChatMarker(messageDiv, cached[i].tags);
+                    cached.splice(i, 1);
+                    return;
+                }
+            }
+        }
+        // Otherwise queue this message for the IRC side to find when it arrives
+        if (!ircPendingByName.has(name)) ircPendingByName.set(name, []);
+        ircPendingByName.get(name).push({ messageDiv: messageDiv, ts: now });
+    }
+
+    function ircHandlePrivmsg(parsed) {
+        var channelName = (parsed.params[0] || '').replace(/^#/, '').toLowerCase();
+        // Only match against the host channel — that's where shared-chat tags appear
+        if (channelName !== twitchHostChannel) return;
+
+        var tags = parsed.tags;
+        var displayName = tags['display-name'] || (parsed.prefix.split('!')[0] || '');
+        var name = displayName.toLowerCase().trim();
+        if (!name) return;
+        var ts = parseInt(tags['tmi-sent-ts'], 10);
+        if (!isFinite(ts)) ts = Date.now();
+
+        // Try matching a pending SSN-rendered message first (IRC arrived later)
+        var pending = ircPendingByName.get(name);
+        if (pending && pending.length) {
+            for (var i = pending.length - 1; i >= 0; i--) {
+                if (Math.abs(pending[i].ts - ts) < IRC_MATCH_WINDOW_MS
+                    || Math.abs(pending[i].ts - Date.now()) < IRC_MATCH_WINDOW_MS) {
+                    applySharedChatMarker(pending[i].messageDiv, tags);
+                    pending.splice(i, 1);
+                }
+            }
+            if (pending.length === 0) ircPendingByName.delete(name);
+        }
+
+        // Cache for SSN messages that arrive after IRC
+        if (!ircCacheByName.has(name)) ircCacheByName.set(name, []);
+        ircCacheByName.get(name).push({
+            tags: tags,
+            ts: ts,
+            expiresAt: Date.now() + IRC_CACHE_TTL_MS
+        });
+    }
+
+    function ircHandleRoomstate(parsed) {
+        var channelName = (parsed.params[0] || '').replace(/^#/, '').toLowerCase();
+        var roomId = parsed.tags['room-id'];
+        if (!channelName || !roomId) return;
+        ircRoomIdToName.set(roomId, channelName);
+        if (channelName === twitchHostChannel) ircHostRoomId = roomId;
+        ircDebug('roomstate', channelName, '->', roomId);
+    }
+
+    function setupTwitchIRC() {
+        if (!twitchHostChannel) return;
+        var ircUrl = 'wss://irc-ws.chat.twitch.tv:443';
+        var ircSocket = null;
+        var reconnectAttempts = 0;
+        var pingInterval = null;
+
+        function connect() {
+            try {
+                ircSocket = new WebSocket(ircUrl);
+            } catch (e) {
+                ircDebug('connect threw', e);
+                scheduleReconnect();
+                return;
+            }
+            ircSocket.onopen = function () {
+                reconnectAttempts = 0;
+                var anon = 'justinfan' + Math.floor(Math.random() * 9999999);
+                ircSocket.send('CAP REQ :twitch.tv/tags twitch.tv/commands\r\n');
+                ircSocket.send('PASS SCHMOOPIIE\r\n');
+                ircSocket.send('NICK ' + anon + '\r\n');
+                var channels = [twitchHostChannel].concat(collabChannels)
+                    .filter(function (v, i, a) { return v && a.indexOf(v) === i; });
+                channels.forEach(function (ch) {
+                    ircSocket.send('JOIN #' + ch + '\r\n');
+                });
+                ircDebug('connected as', anon, 'joining', channels);
+                // Twitch IRC pings every ~5min; we proactively ping to keep alive
+                pingInterval = setInterval(function () {
+                    try { ircSocket.send('PING :tmi.twitch.tv\r\n'); } catch (e) {}
+                }, 4 * 60 * 1000);
+            };
+            ircSocket.onmessage = function (e) {
+                var raw = typeof e.data === 'string' ? e.data : '';
+                raw.split('\r\n').forEach(function (line) {
+                    if (!line) return;
+                    if (line.indexOf('PING ') === 0) {
+                        try { ircSocket.send('PONG ' + line.substring(5) + '\r\n'); } catch (err) {}
+                        return;
+                    }
+                    var parsed = parseIrcLine(line);
+                    if (!parsed) return;
+                    if (parsed.command === 'PRIVMSG') ircHandlePrivmsg(parsed);
+                    else if (parsed.command === 'ROOMSTATE') ircHandleRoomstate(parsed);
+                });
+            };
+            ircSocket.onclose = function () {
+                if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+                ircDebug('socket closed, will reconnect');
+                scheduleReconnect();
+            };
+            ircSocket.onerror = function (e) { ircDebug('socket error', e); };
+        }
+
+        function scheduleReconnect() {
+            reconnectAttempts++;
+            var delay = Math.min(30000, 1000 * Math.pow(2, Math.min(reconnectAttempts, 5)));
+            setTimeout(connect, delay);
+        }
+
+        connect();
+    }
+
+    // GC stale entries every 10s
+    setInterval(function () {
+        var now = Date.now();
+        ircCacheByName.forEach(function (entries, key) {
+            var keep = entries.filter(function (e) { return e.expiresAt > now; });
+            if (keep.length === 0) ircCacheByName.delete(key);
+            else ircCacheByName.set(key, keep);
+        });
+        ircPendingByName.forEach(function (entries, key) {
+            var keep = entries.filter(function (e) { return now - e.ts < IRC_MATCH_WINDOW_MS * 2; });
+            if (keep.length === 0) ircPendingByName.delete(key);
+            else ircPendingByName.set(key, keep);
+        });
+    }, 10000);
+
+    setupTwitchIRC();
+
+</script>
+</body>
+</html>

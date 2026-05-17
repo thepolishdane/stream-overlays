@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<!-- Static preview for sampleoverlay.html: shows how messages render
+     without needing to go live. Open in any browser. CSS is copied from
+     sampleoverlay.html so what you see here matches what OBS will show. -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Overlay Preview — Replies & Shared Chat</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;700&display=swap');
+
+/* Stats top bar — dock-mode-only, full-width opaque strip */
+#stats-bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 28px;
+    background: #0a0a0a;
+    border-bottom: 1px solid #2a2a2a;
+    z-index: 1000;
+    padding: 0 10px;
+    display: none;
+    align-items: center;
+    gap: 8px;
+    font-family: 'Inter', sans-serif;
+    font-size: 12px;
+    color: #fff;
+    text-shadow: none;
+    box-sizing: border-box;
+}
+.stats-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 4px;
+    line-height: 1;
+}
+.stats-icon { width: 14px; height: 14px; display: block; }
+.stats-count { font-weight: 600; font-variant-numeric: tabular-nums; }
+.stats-pill[data-platform="twitch"]  { border-left: 2px solid #9146FF; }
+.stats-pill[data-platform="youtube"] { border-left: 2px solid #FF0000; }
+.stats-pill[data-platform="tiktok"]  { border-left: 2px solid #69C9D0; }
+body.dock-mode #stats-bar { display: flex; top: 50px; } /* below demo toolbar (preview only) */
+body.dock-mode #chat-container { padding-top: 88px !important; } /* clears toolbar + stats bar */
+
+/* ---------- demo chrome ---------- */
+:root { color-scheme: dark; }
+.demo-toolbar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 100;
+    display: flex;
+    gap: 10px;
+    padding: 10px 14px;
+    background: #111;
+    border-bottom: 1px solid #333;
+    font-family: 'Inter', sans-serif;
+    color: #ddd;
+    font-size: 14px;
+    align-items: center;
+    text-shadow: none;
+}
+.demo-toolbar h1 { margin: 0 14px 0 0; font-size: 14px; font-weight: 700; }
+.demo-toolbar button {
+    background: #2a2a2a; color: #ddd;
+    border: 1px solid #444; border-radius: 4px;
+    padding: 6px 12px; cursor: pointer;
+    font-family: inherit; font-size: 13px;
+}
+.demo-toolbar button.active { background: #5a3fc0; border-color: #7d5cd8; color: #fff; }
+.demo-toolbar .spacer { flex: 1; }
+.demo-toolbar .hint { font-size: 12px; color: #888; }
+
+/* fake gameplay backdrop so we can judge readability */
+body.demo-bg-game {
+    background: url('https://picsum.photos/seed/cs2/1920/1080') center/cover no-repeat fixed !important;
+}
+body.demo-bg-dark {
+    background: #1a1a1a !important;
+}
+body.demo-bg-checker {
+    background: repeating-conic-gradient(#222 0deg 90deg, #2c2c2c 90deg 180deg) 0 0/40px 40px !important;
+}
+
+/* ---------- overlay CSS (verbatim from sampleoverlay.html) ---------- */
+body, html {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    font-family: 'Poppins', sans-serif;
+    background-color: transparent !important;
+    overflow: hidden;
+    box-sizing: border-box;
+    text-shadow: 1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 0px 2px 2px rgba(0,0,0,0.8);
+    color: #ffffff;
+    font-size: 32px;
+}
+
+#chat-container {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 100vh;
+    overflow: hidden;
+    padding: 60px 10px 10px 10px; /* extra top padding so toolbar doesn't overlap */
+    box-sizing: border-box;
+}
+
+#message-list-wrapper { width: 100%; }
+
+.message {
+    background: rgba(0, 0, 0, var(--message-bg-alpha, 0.4)) !important;
+    border-radius: 6px;
+    padding: 7px 8px 7px 15px !important;
+    margin-bottom: 6px !important;
+    border: none !important;
+    box-shadow: none !important;
+    color: #ffffff;
+    opacity: 1;
+    transform: translateY(0);
+    overflow: visible !important;
+    position: relative;
+    word-wrap: break-word;
+}
+.message::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 4px;
+    bottom: 4px;
+    width: 4px;
+    border-radius: 4px;
+    background-color: var(--edge-color, #ffffff);
+}
+
+.message-content-wrapper,
+.message-text-meta,
+.message-text-meta > div {
+    display: inline !important;
+}
+
+.avatar-wrapper { display: none !important; }
+
+.name-bg { background: transparent !important; padding: 0 !important; display: inline !important; margin: 0 !important; }
+.name { display: inline !important; font-weight: 700 !important; font-size: 1em; }
+.name::after { content: ":"; color: #dedede !important; margin-right: 4px; font-weight: 700; }
+
+.source-icon {
+    display: inline-block !important;
+    width: 36px !important;
+    height: 36px !important;
+    vertical-align: middle !important;
+    margin-right: 8px !important;
+    margin-bottom: 4px !important;
+}
+.badge, .membership-status, .source-icon { display: none !important; }
+
+.text {
+    display: inline !important;
+    font-size: 1em;
+    line-height: 1.4;
+    margin: 0 !important;
+    color: #ffffff !important;
+    font-weight: 500 !important;
+}
+.text img { max-width: 150px; max-height: 48px; vertical-align: middle !important; margin: -4px 0 !important; }
+
+/* Reply prefix — block above the username row, inside the same .message box */
+.reply-prefix {
+    display: block;
+    font-style: normal !important;
+    font-size: 16px;
+    line-height: 1.3;
+    font-weight: 400 !important;
+    color: #c0c0c0 !important;
+    background: rgba(255, 255, 255, 0.08);
+    border-left: 2px solid rgba(255, 255, 255, 0.35);
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+    max-width: min(80%, 600px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-shadow: none !important;
+}
+.reply-prefix i, .reply-prefix small {
+    font-style: normal !important;
+    font-size: inherit !important;
+    font-weight: inherit !important;
+    color: inherit !important;
+}
+
+/* First-time chatter pill — neutral palette like reply-prefix, hugs its text */
+.first-chat-prefix {
+    display: block;
+    width: fit-content;
+    font-style: normal !important;
+    font-size: 16px;
+    line-height: 1.3;
+    font-weight: 600 !important;
+    color: #c0c0c0 !important;
+    background: rgba(255, 255, 255, 0.08);
+    border-left: 2px solid rgba(255, 255, 255, 0.35);
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    text-shadow: none !important;
+}
+.message.first-chat {
+    background: rgba(76, 209, 55, 0.18) !important;
+}
+body.dock-mode .first-chat-prefix { font-size: 10px !important; padding: 1px 5px !important; margin-bottom: 2px !important; }
+
+.donation { display: inline !important; color: #4cd137; font-weight: 600; margin-left: 5px; }
+
+/* Shared-chat de-emphasis (DOCK ONLY) — collab/partner messages render slightly
+   faded so the host channel's chat pops in OBS Custom Browser Dock. The on-stream
+   browser source is unchanged. Tuned via --shared-opacity (0..1).
+   Values lower than ~0.55 start losing legibility against dock dark grey. */
+body.dock-mode .message.shared .text,
+body.dock-mode .message.shared .name,
+body.dock-mode .message.shared .donation,
+body.dock-mode .message.shared .shared-chat-icon {
+    opacity: var(--shared-opacity, 0.45);
+}
+body.dock-mode .message.shared::before {
+    opacity: var(--shared-opacity, 0.45);
+}
+body.dock-mode .message.shared .reply-prefix {
+    opacity: calc(var(--shared-opacity, 0.45) + 0.15);
+}
+
+/* --- Optional emphasis tweaks. Toggled via body classes from the demo toolbar.
+       Each one is independent so you can mix-and-match. Pick a combo, tell me. */
+
+/* (a) shared messages render at slightly smaller font-size (subtle hierarchy) */
+body.dock-mode.shared-smaller .message.shared { font-size: 0.85em; }
+
+/* (b) indent shared messages 12px so host chat clearly hugs the left edge */
+body.dock-mode.shared-indent .message.shared { margin-left: 14px; }
+
+/* (c) drop the colored edge bar on shared messages — only host gets the bar */
+body.dock-mode.shared-no-bar .message.shared::before { display: none; }
+body.dock-mode.shared-no-bar .message.shared { padding-left: 8px !important; }
+
+/* (d) make host names bolder/larger — opposite emphasis route */
+body.dock-mode.host-bold .message:not(.shared) .name {
+    font-weight: 800 !important;
+    font-size: 1.05em;
+    text-shadow: 0 0 1px currentColor;
+}
+/* Shared chat marker */
+.shared-chat-marker {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    margin-right: 8px;
+    line-height: 0;
+}
+.shared-chat-marker:empty { display: none !important; }
+.shared-chat-icon {
+    display: block;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #ffd700;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+    flex-shrink: 0;
+}
+
+/* ---------- dock-mode (matches isdock=true injection) ---------- */
+body.dock-mode {
+    background-color: #18181b !important;
+    font-size: 16px !important;
+    text-shadow: none !important;
+}
+body.dock-mode .source-icon,
+body.dock-mode .badge,
+body.dock-mode .membership-status { display: inline-block !important; }
+body.dock-mode .source-icon,
+body.dock-mode .badge {
+    width: 18px !important; height: 18px !important;
+    vertical-align: middle !important; margin-right: 4px !important;
+}
+body.dock-mode .text img { max-height: 24px !important; }
+body.dock-mode .shared-chat-icon { width: 10px !important; height: 10px !important; box-shadow: 0 1px 1px rgba(0,0,0,0.5) !important; }
+body.dock-mode .shared-chat-marker { margin-right: 5px !important; }
+body.dock-mode .reply-prefix { font-size: 11px !important; max-width: 220px !important; padding: 1px 5px !important; margin-bottom: 2px !important; }
+</style>
+</head>
+<body class="demo-bg-game">
+
+<div id="stats-bar">
+    <span class="stats-pill" data-platform="twitch">
+        <img class="stats-icon" src="https://socialstream.ninja/sources/images/twitch.png" alt="Twitch">
+        <span class="stats-count">20</span>
+    </span>
+    <span class="stats-pill" data-platform="youtube">
+        <img class="stats-icon" src="https://socialstream.ninja/sources/images/youtube.png" alt="YouTube">
+        <span class="stats-count">55</span>
+    </span>
+    <span class="stats-pill" data-platform="tiktok">
+        <img class="stats-icon" src="https://socialstream.ninja/sources/images/tiktok.png" alt="TikTok">
+        <span class="stats-count">122</span>
+    </span>
+</div>
+
+<div class="demo-toolbar">
+    <h1>Overlay preview</h1>
+    <button id="btn-overlay" class="active">Overlay (32px)</button>
+    <button id="btn-dock">Dock (16px)</button>
+    <span class="spacer"></span>
+    <span class="hint">Msg bg α:</span>
+    <input type="range" id="bg-alpha" min="0" max="1" step="0.05" value="0.4" style="width:120px;">
+    <span id="bg-alpha-val" class="hint" style="min-width:30px;">0.40</span>
+    <span class="hint" style="margin-left:14px;" title="Dock mode only">Shared α:</span>
+    <input type="range" id="shared-alpha" min="0.3" max="1" step="0.05" value="0.45" style="width:120px;">
+    <span id="shared-alpha-val" class="hint" style="min-width:30px;">0.45</span>
+    <button id="t-smaller" class="toggle" title="Shared messages render smaller">smaller</button>
+    <button id="t-indent" class="toggle" title="Indent shared messages">indent</button>
+    <button id="t-no-bar" class="toggle" title="Drop edge bar on shared">no bar</button>
+    <button id="t-host-bold" class="toggle" title="Bold host names">host bold</button>
+    <span class="hint" style="margin-left:14px;">Background:</span>
+    <button id="bg-game" class="active">Gameplay</button>
+    <button id="bg-dark">Dark panel</button>
+    <button id="bg-checker">Checkerboard</button>
+    <button id="fake-stats" style="margin-left:14px;">Fake viewer counts</button>
+</div>
+
+<div id="chat-container">
+    <div id="message-list-wrapper"></div>
+</div>
+
+<script>
+const SHARED_SVG = '<span class="shared-chat-icon" aria-hidden="true"></span>';
+
+const PLATFORM_COLOR = {
+    twitch: '#9146FF',
+    youtube: '#FF0000',
+    tiktok: '#333333',
+    kick: '#53fc18'
+};
+
+// SSN reply HTML: <i><small>Replying to @user: original message:&nbsp;</small></i> reply
+function replyHtml(target, originalMessage, replyText) {
+    return '<i><small>Replying to @' + target + ': ' + originalMessage + ':&nbsp;</small></i> ' + replyText;
+}
+
+function makeMessage({ platform, name, nameColor, message, shared, sharedFrom, donation, firstchat }) {
+    const div = document.createElement('div');
+    div.className = 'message' + (shared ? ' shared' : '') + (firstchat ? ' first-chat' : '');
+    div.style.setProperty('--edge-color', PLATFORM_COLOR[platform] || '#fff');
+
+    // Mirror the live overlay: parse leading <i><small>...</small></i> as a reply pill
+    let chatmessageMain = message;
+    let replyPrefixHtml = '';
+    const replyMatch = chatmessageMain.match(/^(<i><small>[\s\S]*?<\/small><\/i>)\s*/);
+    if (replyMatch) {
+        replyPrefixHtml = replyMatch[1];
+        chatmessageMain = chatmessageMain.substring(replyMatch[0].length);
+    }
+    const replyPrefixDiv = replyPrefixHtml ? '<div class="reply-prefix">' + replyPrefixHtml + '</div>' : '';
+    const firstChatDiv = firstchat ? '<div class="first-chat-prefix">new chatter</div>' : '';
+
+    const sharedSlot = platform === 'twitch'
+        ? '<span class="shared-chat-marker" data-shared-marker-slot="1" '
+          + (shared ? 'title="Shared chat' + (sharedFrom ? ' — from ' + sharedFrom : '') + '">' + SHARED_SVG : '>')
+          + '</span>'
+        : '';
+
+    const nameStyle = nameColor ? 'style="color: ' + nameColor + ' !important;"' : '';
+    const donationHtml = donation ? '<div class="donation">' + donation + '</div>' : '';
+
+    div.innerHTML =
+        firstChatDiv
+      + replyPrefixDiv
+      + '<div class="message-content-wrapper">'
+      + '  <div class="message-text-meta">'
+      + '    <div>'
+      +        sharedSlot
+      + '      <div class="name-bg"><div class="name" ' + nameStyle + '>' + name + '</div></div>'
+      + '    </div>'
+      + '    <div class="text">' + chatmessageMain + '</div>'
+      +      donationHtml
+      + '  </div>'
+      + '</div>';
+    return div;
+}
+
+const SCENARIOS = [
+    {
+        platform: 'twitch',
+        name: 'ThePolishDane',
+        nameColor: '#1abc9c',
+        message: 'GG that final round was insane',
+        // host channel — no shared marker
+    },
+    {
+        platform: 'twitch',
+        name: 'CT_xandermo',
+        nameColor: '#ff6b6b',
+        message: 'are you running new mouse settings?',
+    },
+    {
+        platform: 'twitch',
+        name: 'ThePolishDane',
+        nameColor: '#1abc9c',
+        // reply from host channel — should have NO shared marker, NO right-shift
+        message: replyHtml('CT_xandermo',
+            'are you running new mouse settings?',
+            'yeah dropped to 800 DPI last week, feels way better'),
+    },
+    {
+        platform: 'twitch',
+        name: 'collab_streamer',
+        nameColor: '#9b59b6',
+        message: 'lmao that was clean',
+        shared: true,
+        sharedFrom: 'collab_streamer',
+    },
+    {
+        platform: 'twitch',
+        name: 'someviewer42',
+        nameColor: '#3498db',
+        // shared chat reply — chain icon + compact quote pill
+        message: replyHtml('ThePolishDane',
+            'yeah dropped to 800 DPI last week, feels way better',
+            'I switched to 1600 and my aim got worse not gonna lie'),
+        shared: true,
+        sharedFrom: 'collab_streamer',
+    },
+    {
+        platform: 'twitch',
+        name: 'longwindedviewer',
+        nameColor: '#e67e22',
+        // long reply — show truncation
+        message: replyHtml('ThePolishDane',
+            'this is a really long original message that goes on and on and on and probably needs to be truncated otherwise it would dominate the entire overlay',
+            'totally agree with all of this'),
+        shared: true,
+        sharedFrom: 'partner_streamer',
+    },
+    {
+        platform: 'youtube',
+        name: 'YT_lurker',
+        nameColor: '#f39c12',
+        message: 'first time catching the stream live, hi from Norway',
+        firstchat: true,
+    },
+    {
+        platform: 'twitch',
+        name: 'firsttime_lars',
+        nameColor: '#16a085',
+        message: 'hej fra Aalborg, sygt fed stream',
+        firstchat: true,
+    },
+    {
+        platform: 'tiktok',
+        name: 'newbie_tt',
+        nameColor: '#e91e63',
+        message: 'kommer til dig fra TikTok',
+        firstchat: true,
+    },
+    {
+        platform: 'twitch',
+        name: 'big_tipper',
+        nameColor: '#e74c3c',
+        message: 'enjoy the coffee',
+        donation: '$5.00',
+    },
+    {
+        platform: 'twitch',
+        name: 'ThePolishDane',
+        nameColor: '#1abc9c',
+        message: 'thanks for the support!',
+    },
+    {
+        platform: 'twitch',
+        name: 'paragraphsam',
+        nameColor: '#16a085',
+        // 3-4 line wrap to verify bar height matches text height on long messages
+        message: 'okay so I was thinking about your last play and honestly the way you peeked that angle was actually really smart given the timing of their util usage and the fact that they had no info on your position from the previous round',
+    },
+    {
+        platform: 'twitch',
+        name: 'shortie',
+        nameColor: '#f1c40f',
+        message: 'gg',
+    },
+];
+
+const wrapper = document.getElementById('message-list-wrapper');
+SCENARIOS.forEach(s => wrapper.appendChild(makeMessage(s)));
+
+// Toolbar wiring
+const body = document.body;
+function setActive(group, id) {
+    document.querySelectorAll('.demo-toolbar button').forEach(b => {
+        if (b.dataset.group === group) b.classList.toggle('active', b.id === id);
+    });
+}
+const btnOverlay = document.getElementById('btn-overlay');
+const btnDock = document.getElementById('btn-dock');
+btnOverlay.dataset.group = 'mode';
+btnDock.dataset.group = 'mode';
+btnOverlay.onclick = () => { body.classList.remove('dock-mode'); setActive('mode', 'btn-overlay'); };
+btnDock.onclick = () => { body.classList.add('dock-mode'); setActive('mode', 'btn-dock'); };
+
+document.getElementById('fake-stats').onclick = () => {
+    const fakes = {
+        twitch: Math.floor(900 + Math.random() * 1500),
+        youtube: Math.floor(80 + Math.random() * 400),
+        tiktok: Math.floor(20 + Math.random() * 200)
+    };
+    Object.entries(fakes).forEach(([platform, count]) => {
+        const pill = document.querySelector('.stats-pill[data-platform="' + platform + '"] .stats-count');
+        if (pill) pill.textContent = count.toLocaleString();
+    });
+};
+
+const bgAlphaSlider = document.getElementById('bg-alpha');
+const bgAlphaVal = document.getElementById('bg-alpha-val');
+bgAlphaSlider.addEventListener('input', () => {
+    document.documentElement.style.setProperty('--message-bg-alpha', bgAlphaSlider.value);
+    bgAlphaVal.textContent = parseFloat(bgAlphaSlider.value).toFixed(2);
+});
+
+const sharedAlphaSlider = document.getElementById('shared-alpha');
+const sharedAlphaVal = document.getElementById('shared-alpha-val');
+function applySharedAlpha() {
+    document.documentElement.style.setProperty('--shared-opacity', sharedAlphaSlider.value);
+    sharedAlphaVal.textContent = parseFloat(sharedAlphaSlider.value).toFixed(2);
+}
+sharedAlphaSlider.addEventListener('input', applySharedAlpha);
+applySharedAlpha();
+
+/* Open in dock mode by default — fade is dock-only, no point showing overlay
+   mode first or the slider has zero visible effect. */
+body.classList.add('dock-mode');
+btnOverlay.classList.remove('active');
+btnDock.classList.add('active');
+
+/* Toggle buttons for the alternative emphasis tweaks. Each one flips a body
+   class; styles already wired in the CSS block. Mix freely to find a combo. */
+[
+    ['t-smaller',   'shared-smaller'],
+    ['t-indent',    'shared-indent'],
+    ['t-no-bar',    'shared-no-bar'],
+    ['t-host-bold', 'host-bold']
+].forEach(function (pair) {
+    var btn = document.getElementById(pair[0]);
+    btn.onclick = function () {
+        body.classList.toggle(pair[1]);
+        btn.classList.toggle('active', body.classList.contains(pair[1]));
+    };
+});
+
+['bg-game', 'bg-dark', 'bg-checker'].forEach(id => {
+    const btn = document.getElementById(id);
+    btn.dataset.group = 'bg';
+    btn.onclick = () => {
+        body.classList.remove('demo-bg-game', 'demo-bg-dark', 'demo-bg-checker');
+        body.classList.add('demo-' + id);
+        setActive('bg', id);
+    };
+});
+</script>
+</body>
+</html>
