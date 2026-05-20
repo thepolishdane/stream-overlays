@@ -304,7 +304,7 @@ var STREAK_INACTIVITY_MS = 10000;
 var streaks = {}; /* key = type + '|' + user, value = {row, count, lastTs, timer} */
 
 /* high-volume one-shot-per-user types: FIFO ticker, never lock to main feed */
-var TICKER_TYPES = { join: 1, share: 1 };
+var TICKER_TYPES = { join: 1 };
 
 /* Twitch community-highlight panel re-broadcasts the same fragments every ~30s.
    Group by content: first occurrence creates a row, repeats bump a ×N counter
@@ -556,9 +556,14 @@ function addToFeed(ev) {
   if (userName) html += '<span class="user">' + escapeHtml(userName) + '</span>';
   if (amount)   html += '<span class="amount">' + escapeHtml(amount) + '</span>';
   html += '</div>';
-  if (bodyText && ev.type !== 'sub' && ev.type !== 'resub' && ev.type !== 'gift_sub' && ev.type !== 'follow') {
-    /* sub-style events have machine-generated descriptive HTML; meta-line already carries
-       the info, so the long body would be redundant noise */
+  /* Body line is only useful when the user typed something unique that isn't already
+     in the label/amount/meta. Allowlist of types where body genuinely carries user
+     intent: monetary tips, super chats, cheers, hearts (YT Shorts heart messages).
+     Everything else (like, gift, reward, share, join, raid, follow, sub, resub,
+     gift_sub, highlight, system) has machine-generated body that duplicates the
+     other rows — drop it. */
+  var SHOW_BODY_TYPES = { donation: 1, cheer: 1, hearts: 1, super_chat: 1 };
+  if (bodyText && SHOW_BODY_TYPES[ev.type]) {
     html += '<div class="body">' + escapeHtml(bodyText) + '</div>';
   }
   if (meta) html += '<div class="meta-line">' + escapeHtml(meta) + '</div>';

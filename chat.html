@@ -1199,17 +1199,32 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
 		// have data.event === '' (Twitch shared chat) or undefined (YT/Discord/Facebook/etc).
 		// Anything with a truthy event marker is a non-chat event — drop it.
 		if (data.event) return;
-		if (data.delete) return;
+		// Delete event from SSN (Nightbot/mod auto-deletes, manual mod actions, etc).
+		// Shape: { delete: { type, id, chatname } }. Match by data.delete.id against the
+		// DOM id we set when rendering. Without this handler, banned-word deletions
+		// in Twitch chat still showed in our overlay forever.
+		if (data.delete) {
+			var delId = data.delete && data.delete.id;
+			if (delId) {
+				var existing = document.getElementById(delId);
+				if (existing && existing.parentNode) {
+					existing.parentNode.removeChild(existing);
+					messageTimestamps.delete(delId);
+				}
+			}
+			return;
+		}
 
 		if (!data.chatname && !data.chatmessage && !data.hasDonation && !data.donation && !data.contentimg){
 			return;
 		}
-		
+
 		const messageDiv = document.createElement('div');
 		messageDiv.classList.add('message');
-		
-		// Generate unique ID and track timestamp for aging
-		const messageId = data.mid || 'msg-' + Date.now();
+
+		// Generate unique ID and track timestamp for aging. Prefer SSN's data.id
+		// (platform message UUID) so the delete handler above can match by ID.
+		const messageId = data.mid || data.id || 'msg-' + Date.now();
 		messageDiv.id = messageId;
 		messageTimestamps.set(messageId, Date.now());
 
