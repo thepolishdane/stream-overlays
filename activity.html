@@ -562,7 +562,7 @@ function addToFeed(ev) {
      Everything else (like, gift, reward, share, join, raid, follow, sub, resub,
      gift_sub, highlight, system) has machine-generated body that duplicates the
      other rows — drop it. */
-  var SHOW_BODY_TYPES = { donation: 1, cheer: 1, hearts: 1, super_chat: 1 };
+  var SHOW_BODY_TYPES = { donation: 1, cheer: 1, hearts: 1, super_chat: 1, sub: 1, resub: 1, gift_sub: 1 };
   if (bodyText && SHOW_BODY_TYPES[ev.type]) {
     html += '<div class="body">' + escapeHtml(bodyText) + '</div>';
   }
