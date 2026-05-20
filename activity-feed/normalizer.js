@@ -162,68 +162,86 @@
         }
       });
     }
-    /* Direct-channel sub family (English locale). SSN delivers string events
-       'sub' / 'resub' / 'gift_sub' distinct from both the canonical
-       `new_subscriber` (first-time subs only) and the legacy Twitch shared-chat
-       `event:true` Danish-text path. Without this branch, resubs/gift-subs fall
-       through to 'unknown' and get dropped. Verified 2026-05-20 from Ondal1's
-       12-month resub in prWL6tHT7H capture.
+    /* Twitch sub family — covers BOTH paths SSN delivers events on:
+       a) WebSocket EventSub path (sources/websocket/twitch.js): structured fields
+          (p.tier, p.meta.cumulativeMonths, p.meta.streakMonths, p.total). chatmessage
+          is the user's shared resub message verbatim (no boilerplate).
+       b) DOM-scrape path (sources/twitch.js): chatmessage carries the full
+          chatbot-formatted boilerplate, structured fields absent.
+       Both paths use the same `event` strings — but the data shape differs.
+       Verified 2026-05-20 against SSN main + Ondal1's 12-month resub.
 
-       Formats encountered / anticipated:
-         "<n> subscribed at Tier N. They've subscribed for M months! - <msg>"  (paid resub)
-         "<n> subscribed with Prime. They've subscribed for M months! - <msg>"  (Prime resub)
-         "<n> subscribed at Tier N!"                                            (first paid sub)
-         "<n> subscribed with Prime!"                                           (first Prime sub)
-         "<n> gifted a Tier N sub to <recipient>!"                              (single gift)
-         "<n> is gifting N Tier X subs to the community!"                       (bulk gift)
-       Trailing " - <msg>" only present when user shared a resub message.
-       Anything that doesn't parse cleanly is logged for diagnosis — re-grep the
-       overlay devtools console for [sub-parse-miss] next stream to spot drift. */
-    if (p.event === 'sub' || p.event === 'resub' || p.event === 'gift_sub' || p.event === 'gifted_sub' || p.event === 'subgift') {
+       Tier field: SSN passes Twitch's raw value — literal "Prime" OR "1000"/"2000"/
+       "3000". parseTier() normalizes both forms + the DOM-scrape "1"/"2"/"3" form.
+
+       Gift event: SSN uses ONE event 'subscription_gift' for both single + community
+       gifts — only `total` differs. Chatmessage: "X has gifted N tier T subs!".
+       Anonymous gifters arrive with chatname=null (unguarded on WS path) — we
+       fall back to 'Anonymous' so the row doesn't say literally "null has gifted". */
+    function parseTier(t) {
+      if (t == null) return null;
+      var s = String(t).trim();
+      if (/^prime$/i.test(s)) return 'Prime';
+      if (s === '1000') return 1;
+      if (s === '2000') return 2;
+      if (s === '3000') return 3;
+      var n = parseInt(s, 10);
+      if (!isNaN(n) && n >= 1 && n <= 3) return n;
+      return null;
+    }
+
+    if (p.event === 'subscription_gift') {
+      var giftText = stripHtml(p.chatmessage || '');
+      var gm = giftText.match(/^(\S+)\s+has\s+gifted\s+(\d+)\s+tier\s+(\w+)\s+subs?/i);
+      var giftTotal = (typeof p.total === 'number' ? p.total : null)
+        || (p.meta && typeof p.meta.total === 'number' ? p.meta.total : null)
+        || (gm ? parseInt(gm[2], 10) : null) || 1;
+      var giftTier = parseTier((p.meta && p.meta.tier) || p.tier || (gm ? gm[3] : null));
+      var giftName = p.chatname || (gm ? gm[1] : null) || 'Anonymous';
+      return Object.assign({}, base, {
+        type: 'gift_sub',
+        user: { name: giftName, id: p.userid || '' },
+        message: { text: '', html: p.chatmessage || '' },
+        meta: {
+          tier: giftTier,
+          count: giftTotal,
+          membership: ''
+        }
+      });
+    }
+
+    if (p.event === 'sub' || p.event === 'resub') {
       var subText = stripHtml(p.chatmessage || '');
+      /* DOM-scrape boilerplate parser. "X subscribed at Tier N. They've subscribed
+         for M months! - <user msg>". Trailing " - <msg>" only when user shared. */
+      var dm = subText.match(/^\S+\s+subscribed\s+at\s+Tier\s+(\d+)[.!]?(?:\s+They(?:'|&#39;)ve\s+subscribed\s+for\s+(\d+)\s+months?!?)?(?:\s+[-–]\s+(.*))?$/i);
+      var domTier = dm ? parseTier(dm[1]) : null;
+      var domMonths = dm && dm[2] ? parseInt(dm[2], 10) : null;
+      var domUserMsg = dm && dm[3] ? dm[3].trim() : '';
 
-      /* Gift first — different shape (no "subscribed at/with"). */
-      var giftSingle = subText.match(/^(\S+)\s+gifted\s+a\s+Tier\s+(\d+)\s+sub(?:scription)?\s+to\s+(\S+)/i);
-      var giftBulk = subText.match(/^(\S+)\s+(?:is\s+gifting|gifted)\s+(\d+)\s+Tier\s+(\d+)\s+sub(?:scription)?s?\s+to\s+the\s+community/i);
-      if (p.event === 'gift_sub' || p.event === 'gifted_sub' || p.event === 'subgift' || giftSingle || giftBulk) {
-        var gifter = (giftSingle && giftSingle[1]) || (giftBulk && giftBulk[1]) || p.chatname || '';
-        var gTier = (giftSingle && parseInt(giftSingle[2], 10)) || (giftBulk && parseInt(giftBulk[3], 10)) || null;
-        var recipient = giftSingle && giftSingle[3] || '';
-        var bulkCount = giftBulk && parseInt(giftBulk[2], 10) || null;
-        return Object.assign({}, base, {
-          type: 'gift_sub',
-          user: { name: gifter, id: '' },
-          message: { text: '', html: p.chatmessage || '' },
-          meta: {
-            tier: gTier,
-            recipient: recipient,
-            count: bulkCount,
-            membership: p.membership || ''
-          }
-        });
-      }
+      /* WebSocket EventSub path: structured fields override (or fill where DOM blank). */
+      var wsTier = parseTier((p.meta && p.meta.tier) || p.tier);
+      var wsMonths = (p.meta && (p.meta.cumulativeMonths || p.meta.streakMonths)) || null;
 
-      /* Sub / resub — paid tier OR Prime. */
-      var subM = subText.match(/^\S+\s+subscribed\s+(?:at\s+Tier\s+(\d+)|with\s+(Prime))[.!]?(?:\s+They(?:'|&#39;)ve\s+subscribed\s+for\s+(\d+)\s+months?!?)?(?:\s+[-–]\s+(.*))?$/i);
-      var subTier = subM && subM[1] ? parseInt(subM[1], 10) : null;
-      var subPrime = !!(subM && subM[2]);
-      var subMonths = subM && subM[3] ? parseInt(subM[3], 10) : null;
-      var subUserMsg = subM && subM[4] ? subM[4].trim() : '';
-      if (!subM) {
+      var finalTier = wsTier != null ? wsTier : domTier;
+      var finalMonths = wsMonths || domMonths;
+      /* If DOM regex matched, chatmessage is boilerplate — user msg is in dm[3].
+         If it didn't match, chatmessage is the user's verbatim resub msg (WS path). */
+      var userMsg = dm ? domUserMsg : subText;
+
+      if (!dm && !wsTier && !wsMonths) {
         console.warn('[sub-parse-miss]', p.event, subText);
       }
-      var subType = (p.event === 'resub' || (subMonths && subMonths > 1)) ? 'resub' : 'sub';
+
+      var subType = (p.event === 'resub' || (finalMonths && finalMonths > 1)) ? 'resub' : 'sub';
       return Object.assign({}, base, {
         type: subType,
         user: userFromPayload(p),
-        /* Only carry the user's shared resub message in `text`. Boilerplate is fully
-           captured by meta.tier + meta.months and would just duplicate the label.
-           Body-line renderer (allowlist) shows text only when non-empty. */
-        message: { text: subUserMsg, html: p.chatmessage || '' },
+        message: { text: userMsg, html: p.chatmessage || '' },
         meta: {
-          tier: subTier,
-          months: subMonths,
-          membership: subPrime ? 'Prime' : (p.membership || '')
+          tier: finalTier,
+          months: finalMonths,
+          membership: finalTier === 'Prime' ? 'Prime' : (p.membership || '')
         }
       });
     }

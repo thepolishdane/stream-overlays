@@ -493,14 +493,20 @@ function fmtAmount(amount) {
 function fmtMeta(ev) {
   var m = ev.meta || {};
   var bits = [];
-  if (m.tier)      bits.push('Tier ' + m.tier);
+  /* tier: numeric 1/2/3 → "Tier N", string "Prime" → just "Prime" (matches Twitch UI). */
+  if (m.tier === 'Prime') bits.push('Prime');
+  else if (m.tier)        bits.push('Tier ' + m.tier);
   if (m.membership && !m.tier) bits.push(m.membership); // canonical subs carry text not numeric tier
   if (m.months)    bits.push(m.months + ' mo');
   if (m.streak)    bits.push(m.streak + ' streak');
   if (m.recipient) bits.push('→ ' + m.recipient);
   if (m.gifter_total) bits.push(m.gifter_total + ' total gifts');
   if (m.streak_count) bits.push(m.streak_count + '-stream streak');
-  if (m.gift_name) bits.push(m.gift_name + (m.count > 1 ? ' ×' + m.count : ''));
+  /* gift_sub: meta.count carries number of subs gifted (Twitch EventSub `total`).
+     Render only when >1 to avoid noise on single gifts. gift_name path is separate
+     (TikTok gifts like "Rose ×3"). */
+  if (m.gift_name)               bits.push(m.gift_name + (m.count > 1 ? ' ×' + m.count : ''));
+  else if (m.count && m.count > 1) bits.push('×' + m.count);
   if (m.reward) bits.push(m.reward + (m.cost ? ' · ' + m.cost + ' pts' : ''));
   if (m.streak_total) bits.push(m.streak_total + '× total');
   if (m.source_channel) bits.push('via ' + m.source_channel);
