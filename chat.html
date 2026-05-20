@@ -1054,6 +1054,97 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
         pill.textContent = sum.toLocaleString();
     }
 
+    /* Persistent rolling log of every viewer-update payload SSN delivers.
+       Built to diagnose TikTok pill stuck at 0/1 (see project_ssn_chat_overlay memory).
+       Stores last 2000 entries in localStorage (~16hr at 30s cadence). Console handle
+       `window.__viewer_log` exposes csv/download/count/clear. Survives OBS browser
+       source restarts. Use after a full stream: F12 in dock -> __viewer_log.download(). */
+    var VIEWER_LOG_KEY = 'tpd_viewer_log';
+    var VIEWER_LOG_CAP = 2000;
+    function loadViewerLog() {
+        try { return JSON.parse(localStorage.getItem(VIEWER_LOG_KEY)) || []; }
+        catch (e) { return []; }
+    }
+    function appendViewerLog(data) {
+        try {
+            var log = loadViewerLog();
+            var meta = data && data.meta;
+            var t = (meta && typeof meta === 'object' && !Array.isArray(meta)) ? meta.twitch : null;
+            var y = (meta && typeof meta === 'object' && !Array.isArray(meta)) ? meta.youtube : null;
+            var tk = (meta && typeof meta === 'object' && !Array.isArray(meta)) ? meta.tiktok : null;
+            log.push({
+                ts: Date.now(),
+                iso: new Date().toISOString(),
+                eventName: data && data.event,
+                twitch: (typeof t === 'number') ? t : null,
+                youtube: (typeof y === 'number') ? y : null,
+                tiktok: (typeof tk === 'number') ? tk : null,
+                twitchRaw: JSON.stringify(t),
+                youtubeRaw: JSON.stringify(y),
+                tiktokRaw: JSON.stringify(tk),
+                metaShape: meta && typeof meta,
+                metaIsArray: Array.isArray(meta),
+                singularType: data && data.type,
+                singularMeta: (data && typeof data.meta !== 'object') ? JSON.stringify(data.meta) : null,
+                rawPayload: JSON.stringify(data).slice(0, 800)
+            });
+            while (log.length > VIEWER_LOG_CAP) log.shift();
+            localStorage.setItem(VIEWER_LOG_KEY, JSON.stringify(log));
+            console.log('[viewer-update]', data && data.event, 'twitch=', t, 'youtube=', y, 'tiktok=', tk, 'tiktokRaw=', JSON.stringify(tk));
+        } catch (e) {
+            console.warn('[viewer-log] append failed', e);
+        }
+    }
+    window.__viewer_log = {
+        all: function () { return loadViewerLog(); },
+        count: function () { return loadViewerLog().length; },
+        csv: function () {
+            var log = loadViewerLog();
+            var head = 'iso,eventName,twitch,youtube,tiktok,twitchRaw,youtubeRaw,tiktokRaw,metaShape,metaIsArray,singularType,singularMeta\n';
+            var body = log.map(function (r) {
+                function esc(v) {
+                    if (v === null || v === undefined) return '';
+                    var s = String(v);
+                    if (s.indexOf(',') !== -1 || s.indexOf('"') !== -1 || s.indexOf('\n') !== -1) {
+                        return '"' + s.replace(/"/g, '""') + '"';
+                    }
+                    return s;
+                }
+                return [r.iso, r.eventName, r.twitch, r.youtube, r.tiktok,
+                        r.twitchRaw, r.youtubeRaw, r.tiktokRaw,
+                        r.metaShape, r.metaIsArray, r.singularType, r.singularMeta].map(esc).join(',');
+            }).join('\n');
+            return head + body;
+        },
+        download: function () {
+            var csv = this.csv();
+            var stamp = new Date().toISOString().replace(/[:.]/g, '-');
+            var fname = 'viewer-log-' + stamp + '.csv';
+            window.__viewer_log_lastDump = csv;
+            try {
+                var blob = new Blob([csv], { type: 'text/csv' });
+                var url = URL.createObjectURL(blob);
+                var a = document.createElement('a');
+                a.href = url; a.download = fname;
+                document.body.appendChild(a); a.click();
+                setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+                console.log('[viewer-log] download attempted as', fname, '(' + this.count() + ' rows). If no file appeared (OBS CEF blocks <a download>), CSV is in window.__viewer_log_lastDump and on your clipboard.');
+            } catch (e) { console.warn('[viewer-log] blob download failed', e); }
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(csv).then(function () {
+                        console.log('[viewer-log] CSV copied to clipboard (' + csv.length + ' chars).');
+                    });
+                }
+            } catch (e) { /* clipboard unsupported, lastDump still available */ }
+            return fname;
+        },
+        clear: function () {
+            localStorage.removeItem(VIEWER_LOG_KEY);
+            console.log('[viewer-log] cleared');
+        }
+    };
+
     /* SSN sends `viewer_updates` (plural) with `meta: { twitch: N, youtube: N, tiktok: N }`.
        Older docs / single-platform builds may also emit `viewer_update` (singular) with
        `data.type` + flat `data.meta` int. Handle both. Verified via 2026-05-06 capture.
@@ -1061,7 +1152,7 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
        inspectable post-stream — needed to diagnose the TikTok pill stuck at 0/1 (likely
        SSN's TikTok scraper reporting a live-flag boolean instead of viewer count). */
     function handleViewerUpdate(data) {
-        try { console.log('[viewer-update]', JSON.stringify(data)); } catch (e) {}
+        appendViewerLog(data);
         if (data.meta && typeof data.meta === 'object' && !Array.isArray(data.meta)) {
             Object.keys(data.meta).forEach(function (plat) {
                 setPlatformPill(plat.toLowerCase(), data.meta[plat]);
