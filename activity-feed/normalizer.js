@@ -162,32 +162,68 @@
         }
       });
     }
-    /* Direct-channel resub (English locale). SSN delivers a string `event: 'resub'`
-       distinct from both the canonical `new_subscriber` (first-time subs) and the
-       legacy Twitch shared-chat `event:true` Danish-text path. Without this branch
-       resubs fall through to 'unknown' and get dropped. Verified 2026-05-20 from
-       Ondal1's 12-month resub in the prWL6tHT7H capture. Format:
-         "<name> subscribed at Tier N. They've subscribed for M months! - <message>"
-       The trailing "- <message>" only appears if the user shared a resub message. */
-    if (p.event === 'resub' || p.event === 'sub') {
+    /* Direct-channel sub family (English locale). SSN delivers string events
+       'sub' / 'resub' / 'gift_sub' distinct from both the canonical
+       `new_subscriber` (first-time subs only) and the legacy Twitch shared-chat
+       `event:true` Danish-text path. Without this branch, resubs/gift-subs fall
+       through to 'unknown' and get dropped. Verified 2026-05-20 from Ondal1's
+       12-month resub in prWL6tHT7H capture.
+
+       Formats encountered / anticipated:
+         "<n> subscribed at Tier N. They've subscribed for M months! - <msg>"  (paid resub)
+         "<n> subscribed with Prime. They've subscribed for M months! - <msg>"  (Prime resub)
+         "<n> subscribed at Tier N!"                                            (first paid sub)
+         "<n> subscribed with Prime!"                                           (first Prime sub)
+         "<n> gifted a Tier N sub to <recipient>!"                              (single gift)
+         "<n> is gifting N Tier X subs to the community!"                       (bulk gift)
+       Trailing " - <msg>" only present when user shared a resub message.
+       Anything that doesn't parse cleanly is logged for diagnosis — re-grep the
+       overlay devtools console for [sub-parse-miss] next stream to spot drift. */
+    if (p.event === 'sub' || p.event === 'resub' || p.event === 'gift_sub' || p.event === 'gifted_sub' || p.event === 'subgift') {
       var subText = stripHtml(p.chatmessage || '');
-      var m = subText.match(/^\S+\s+subscribed\s+at\s+Tier\s+(\d+)[.!]?(?:\s+They(?:'|&#39;)ve\s+subscribed\s+for\s+(\d+)\s+months?!?)?(?:\s+[-–]\s+(.*))?$/i);
-      var subTier = m && m[1] ? parseInt(m[1], 10) : null;
-      var subMonths = m && m[2] ? parseInt(m[2], 10) : null;
-      var subUserMsg = m && m[3] ? m[3].trim() : '';
+
+      /* Gift first — different shape (no "subscribed at/with"). */
+      var giftSingle = subText.match(/^(\S+)\s+gifted\s+a\s+Tier\s+(\d+)\s+sub(?:scription)?\s+to\s+(\S+)/i);
+      var giftBulk = subText.match(/^(\S+)\s+(?:is\s+gifting|gifted)\s+(\d+)\s+Tier\s+(\d+)\s+sub(?:scription)?s?\s+to\s+the\s+community/i);
+      if (p.event === 'gift_sub' || p.event === 'gifted_sub' || p.event === 'subgift' || giftSingle || giftBulk) {
+        var gifter = (giftSingle && giftSingle[1]) || (giftBulk && giftBulk[1]) || p.chatname || '';
+        var gTier = (giftSingle && parseInt(giftSingle[2], 10)) || (giftBulk && parseInt(giftBulk[3], 10)) || null;
+        var recipient = giftSingle && giftSingle[3] || '';
+        var bulkCount = giftBulk && parseInt(giftBulk[2], 10) || null;
+        return Object.assign({}, base, {
+          type: 'gift_sub',
+          user: { name: gifter, id: '' },
+          message: { text: '', html: p.chatmessage || '' },
+          meta: {
+            tier: gTier,
+            recipient: recipient,
+            count: bulkCount,
+            membership: p.membership || ''
+          }
+        });
+      }
+
+      /* Sub / resub — paid tier OR Prime. */
+      var subM = subText.match(/^\S+\s+subscribed\s+(?:at\s+Tier\s+(\d+)|with\s+(Prime))[.!]?(?:\s+They(?:'|&#39;)ve\s+subscribed\s+for\s+(\d+)\s+months?!?)?(?:\s+[-–]\s+(.*))?$/i);
+      var subTier = subM && subM[1] ? parseInt(subM[1], 10) : null;
+      var subPrime = !!(subM && subM[2]);
+      var subMonths = subM && subM[3] ? parseInt(subM[3], 10) : null;
+      var subUserMsg = subM && subM[4] ? subM[4].trim() : '';
+      if (!subM) {
+        console.warn('[sub-parse-miss]', p.event, subText);
+      }
       var subType = (p.event === 'resub' || (subMonths && subMonths > 1)) ? 'resub' : 'sub';
       return Object.assign({}, base, {
         type: subType,
         user: userFromPayload(p),
-        /* Only carry the user's shared resub message in `text`. Boilerplate
-           ("X subscribed at Tier N. They've subscribed for M months!") is fully
+        /* Only carry the user's shared resub message in `text`. Boilerplate is fully
            captured by meta.tier + meta.months and would just duplicate the label.
            Body-line renderer (allowlist) shows text only when non-empty. */
         message: { text: subUserMsg, html: p.chatmessage || '' },
         meta: {
           tier: subTier,
           months: subMonths,
-          membership: p.membership || ''
+          membership: subPrime ? 'Prime' : (p.membership || '')
         }
       });
     }
