@@ -45,6 +45,8 @@
 .stats-pill[data-platform="twitch"]  { border-left: 2px solid #9146FF; }
 .stats-pill[data-platform="youtube"] { border-left: 2px solid #FF0000; }
 .stats-pill[data-platform="tiktok"]  { border-left: 2px solid #69C9D0; }
+.stats-pill[data-platform="total"]   { border-left: 2px solid #ffffff; }
+.stats-total-icon { display: inline-block; width: 14px; text-align: center; font-weight: 700; font-size: 14px; line-height: 1; color: #ffffff; }
 body.dock-mode #stats-bar { display: flex; top: 50px; } /* below demo toolbar (preview only) */
 body.dock-mode #chat-container { padding-top: 88px !important; } /* clears toolbar + stats bar */
 
@@ -313,6 +315,10 @@ body.dock-mode .reply-prefix { font-size: 11px !important; max-width: 220px !imp
         <img class="stats-icon" src="https://socialstream.ninja/sources/images/tiktok.png" alt="TikTok">
         <span class="stats-count">122</span>
     </span>
+    <span class="stats-pill" data-platform="total" title="Total across all platforms">
+        <span class="stats-icon stats-total-icon">&Sigma;</span>
+        <span class="stats-count">197</span>
+    </span>
 </div>
 
 <div class="demo-toolbar">
@@ -522,10 +528,14 @@ document.getElementById('fake-stats').onclick = () => {
         youtube: Math.floor(80 + Math.random() * 400),
         tiktok: Math.floor(20 + Math.random() * 200)
     };
+    let sum = 0;
     Object.entries(fakes).forEach(([platform, count]) => {
         const pill = document.querySelector('.stats-pill[data-platform="' + platform + '"] .stats-count');
         if (pill) pill.textContent = count.toLocaleString();
+        sum += count;
     });
+    const totalPill = document.querySelector('.stats-pill[data-platform="total"] .stats-count');
+    if (totalPill) totalPill.textContent = sum.toLocaleString();
 };
 
 const bgAlphaSlider = document.getElementById('bg-alpha');

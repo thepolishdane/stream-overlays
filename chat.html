@@ -426,6 +426,9 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
     color: #ff5555;
     font-weight: 700;
     font-size: 10px;
+    display: inline-block;
+    transform-origin: center;
+    will-change: transform, filter;
 }
 .stats-pill {
     display: inline-flex;
@@ -448,6 +451,16 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
 .stats-pill[data-platform="twitch"]  { border-left: 2px solid #9146FF; }
 .stats-pill[data-platform="youtube"] { border-left: 2px solid #FF0000; }
 .stats-pill[data-platform="tiktok"]  { border-left: 2px solid #69C9D0; }
+.stats-pill[data-platform="total"]   { border-left: 2px solid #ffffff; }
+.stats-total-icon {
+    display: inline-block;
+    width: 14px;
+    text-align: center;
+    font-weight: 700;
+    font-size: 14px;
+    line-height: 1;
+    color: #ffffff;
+}
 
 /* &debug=true banner */
 #debug-banner {
@@ -480,9 +493,12 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
         <img class="stats-icon" src="https://socialstream.ninja/sources/images/tiktok.png" alt="TikTok">
         <span class="stats-count">—</span>
     </span>
+    <span class="stats-pill" data-platform="total" title="Total across all platforms">
+        <span class="stats-icon stats-total-icon">&Sigma;</span>
+        <span class="stats-count">—</span>
+    </span>
     <span class="stats-pill stats-capture" id="capture-toggle" title="Toggle capture panel">
         <span class="cap-dot">●</span>
-        <span class="stats-count" id="capture-pill-count">0</span>
     </span>
 </div>
 <div id="chat-container">
@@ -502,6 +518,7 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
     var scrollMode = urlParams.has("scroll") && urlParams.get("scroll") !== "false";
     var debugMode = urlParams.has("debug") && urlParams.get("debug") !== "false";
     var captureMode = urlParams.has("capture") && urlParams.get("capture") !== "false";
+    var latestPlatformCounts = {};
 
     var twitchHostChannel = urlParams.has("twitchchannel")
         ? urlParams.get("twitchchannel").toLowerCase().replace(/^#/, '').trim()
@@ -530,10 +547,7 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
 
     if (urlParams.has("fakestats") && urlParams.get("fakestats") !== "false") {
         var fakes = { twitch: 20, youtube: 55, tiktok: 122 };
-        Object.keys(fakes).forEach(function (p) {
-            var pill = document.querySelector('.stats-pill[data-platform="' + p + '"] .stats-count');
-            if (pill) pill.textContent = fakes[p].toLocaleString();
-        });
+        Object.keys(fakes).forEach(function (p) { setPlatformPill(p, fakes[p]); });
     }
 
     if (scrollMode) document.body.classList.add('scroll-mode');
@@ -754,8 +768,6 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
         var bodyEl = capturePanelEl.querySelector('.cap-body');
         if (!bodyEl) return;
         var rows = [];
-        var pillCount = document.getElementById('capture-pill-count');
-        if (pillCount) pillCount.textContent = captureCounters.total;
         rows.push('<div class="cap-row cap-total">total: ' + captureCounters.total + '</div>');
         rows.push('<div class="cap-row cap-kind">chat: ' + captureCounters.byKind.chat + ' &nbsp; event: ' + captureCounters.byKind.event + '</div>');
         rows.push('<div class="cap-section">platforms</div>');
@@ -1021,15 +1033,35 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
         var pill = document.querySelector('.stats-pill[data-platform="' + platform + '"] .stats-count');
         if (!pill) return;
         if (typeof count !== 'number') count = parseInt(count, 10);
-        if (isNaN(count) || count < 0) { pill.textContent = '—'; }
-        else { pill.textContent = count.toLocaleString(); }
+        if (isNaN(count) || count < 0) {
+            pill.textContent = '—';
+            if (platform !== 'total') delete latestPlatformCounts[platform];
+        } else {
+            pill.textContent = count.toLocaleString();
+            if (platform !== 'total') latestPlatformCounts[platform] = count;
+        }
+        if (platform !== 'total') updateTotalPill();
         if (debugMode) console.log('[overlay-stats]', platform, count);
+    }
+
+    function updateTotalPill() {
+        var pill = document.querySelector('.stats-pill[data-platform="total"] .stats-count');
+        if (!pill) return;
+        var keys = Object.keys(latestPlatformCounts);
+        if (keys.length === 0) { pill.textContent = '—'; return; }
+        var sum = 0;
+        for (var i = 0; i < keys.length; i++) sum += latestPlatformCounts[keys[i]];
+        pill.textContent = sum.toLocaleString();
     }
 
     /* SSN sends `viewer_updates` (plural) with `meta: { twitch: N, youtube: N, tiktok: N }`.
        Older docs / single-platform builds may also emit `viewer_update` (singular) with
-       `data.type` + flat `data.meta` int. Handle both. Verified via 2026-05-06 capture. */
+       `data.type` + flat `data.meta` int. Handle both. Verified via 2026-05-06 capture.
+       Always log raw payload (low-volume event, ~30s cadence) so per-platform values are
+       inspectable post-stream — needed to diagnose the TikTok pill stuck at 0/1 (likely
+       SSN's TikTok scraper reporting a live-flag boolean instead of viewer count). */
     function handleViewerUpdate(data) {
+        try { console.log('[viewer-update]', JSON.stringify(data)); } catch (e) {}
         if (data.meta && typeof data.meta === 'object' && !Array.isArray(data.meta)) {
             Object.keys(data.meta).forEach(function (plat) {
                 setPlatformPill(plat.toLowerCase(), data.meta[plat]);
@@ -1039,6 +1071,19 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
         var platform = (data.type || '').toLowerCase();
         if (!platform) return;
         setPlatformPill(platform, data.meta);
+    }
+
+    /* Pulse the red live dot on the capture pill. Web Animations API (not CSS class flip)
+       because OBS CEF + Electron batch DOM mutations and treat start-state == end-state,
+       suppressing re-triggers. See feedback in project_ssn_activity_feed.md (2026-05-15). */
+    function pulseLiveDot() {
+        var dot = document.querySelector('#capture-toggle .cap-dot');
+        if (!dot) return;
+        dot.animate([
+            { transform: 'scale(1)',   filter: 'drop-shadow(0 0 0 rgba(255,85,85,0))'   },
+            { transform: 'scale(1.6)', filter: 'drop-shadow(0 0 6px rgba(255,85,85,0.9))', offset: 0.4 },
+            { transform: 'scale(1)',   filter: 'drop-shadow(0 0 0 rgba(255,85,85,0))'   }
+        ], { duration: 600, easing: 'ease-out' });
     }
 
     function addMessageToOverlay(data) {
@@ -1186,6 +1231,7 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
 		}
 		void messageDiv.offsetWidth;
 		messageDiv.classList.add('visible');
+		pulseLiveDot();
 
 		// IRC enrichment hook — register pending Twitch messages or apply marker
 		// immediately if IRC has already cached a matching PRIVMSG.
