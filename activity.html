@@ -412,7 +412,11 @@ function addToStreak(ev) {
     row.querySelector('.user').textContent = ev.user.name;
     row.querySelector('.meta-line').textContent = (ev.platform || '') + ' · ' + ev.type;
   }
-  s.count++;
+  /* Batched events (e.g. TikTok likes from the stats bridge) carry a real count in
+     amount.value / meta.batched — add it so the row shows the true total, not the
+     number of messages received. Unbatched events increment by 1 as before. */
+  var inc = (ev.amount && Number(ev.amount.value)) || (ev.meta && Number(ev.meta.batched)) || 1;
+  s.count += inc;
   s.lastTs = Date.now();
   s.row.querySelector('.num').textContent = s.count;
   if (s.timer) clearTimeout(s.timer);
@@ -770,6 +774,29 @@ if (urlParams.has("server") || urlParams.has("server2")) {
   socketserver = new WebSocket(serverURL);
   setupSocket();
 }
+
+/* Optional loopback bridge to the local stats recorder. Supplies canonical events
+   the SSN feed can't deliver for TikTok — currently LIKES. Opt-in via
+   ?statsbridge=ws://127.0.0.1:8913. Loopback ws:// is exempt from mixed-content
+   blocking, so no TLS is needed even though this page is served over https.
+   Events arrive pre-normalized and go straight to handleCanonical(). */
+(function setupStatsBridge() {
+  var bridgeURL = urlParams.get("statsbridge");
+  if (!bridgeURL) return;
+  var bws = null, retry = 1;
+  function conn() {
+    try { bws = new WebSocket(bridgeURL); } catch (e) { return; }
+    bws.onopen = function () { retry = 1; };
+    bws.onmessage = function (event) {
+      if (!event.data) return;
+      try { var c = JSON.parse(event.data); if (c && c.type) handleCanonical(c); }
+      catch (err) { /* ignore malformed bridge frames */ }
+    };
+    bws.onclose = function () { setTimeout(conn, Math.min(1000 * retry++, 15000)); };
+    bws.onerror = function () { try { bws.close(); } catch (_) {} };
+  }
+  conn();
+})();
 
 /* --- fake data for layout previewing in OBS --- */
 if (fakeData) {
