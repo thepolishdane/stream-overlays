@@ -1010,7 +1010,15 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
             stickToBottom = distanceFromBottom <= SCROLL_STICK_THRESHOLD_PX;
         }, { passive: true });
     }
-    
+
+    // Re-pin to bottom whenever the message column's height changes AFTER insertion —
+    // late-loading avatars/emotes/wrapped lines would otherwise leave the newest
+    // message partly cut off ("half a message"). View-only overlay, so always re-pin.
+    if (!reversed && typeof ResizeObserver === 'function') {
+        var _pinObserver = new ResizeObserver(function () { adjustMessageWrapperScroll(); });
+        _pinObserver.observe(messageListWrapper);
+    }
+
 	setInterval(() => {
 		const now = Date.now();
 		const messages = Array.from(messageListWrapper.children).filter(
