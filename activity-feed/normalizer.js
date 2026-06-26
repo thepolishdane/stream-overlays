@@ -429,6 +429,16 @@
           meta: {}
         });
       }
+      /* Catch-all for unclassified TikTok event:true. This branch fires for
+         high-frequency NOISE that carries no user and no actionable info — most
+         notably the room member/viewer-count ticks ("· N", empty chatname, fired
+         ~once per viewer change, redundant with viewer_updates). Those previously
+         rendered as blank "SYSTEM" rows and flooded the activity dock (verified
+         on the 2026-06-26 capture). Drop anything user-less OR a bare counter;
+         keep genuinely new user-bearing events as 'system' so unmapped TikTok
+         types stay visible for debugging (mirrors the Twitch event:true policy). */
+      var bareCounter = /^[·•∙‧⋅]?\s*\d+$/.test(ttext);
+      if (!p.chatname || bareCounter) return null;
       return Object.assign({}, base, {
         type: 'system',
         user: userFromPayload(p),
