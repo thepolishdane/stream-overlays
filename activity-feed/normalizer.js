@@ -51,6 +51,19 @@
     return m ? { milestone: 'viewer_streak', streak_count: parseInt(m[1], 10) } : null;
   }
 
+  function parseTwitchModAnniversary(text) {
+    /* Twitch "modiversary" USERNOTICE system-msg.
+       EN: "Fuzkeren has been a Moderator for 7 years!" (observed 2026-07-06)
+       DK: "har været moderator i 7 år" (unobserved; defensive).
+       Months variant unobserved but Twitch uses months elsewhere — cover it. */
+    var m = text.match(/has\s+been\s+a\s+moderator\s+for\s+(\d+)\s+(year|month)s?/i)
+         || text.match(/har\s+været\s+moderator\s+i\s+(\d+)\s+(år|måned(?:er)?)/i);
+    if (!m) return null;
+    var n = parseInt(m[1], 10);
+    var isYears = /^(year|år)/i.test(m[2]);
+    return { years: isYears ? n : null, months: isYears ? null : n };
+  }
+
   function parseTwitchGiftSubDanish(text) {
     /* two phrasings observed:
        "X forærede et abonnement på niveau N til Y i kanalen tilhørende Z og har dermed givet K gaveabonnementer"
@@ -245,6 +258,23 @@
         }
       });
     }
+    /* Twitch mod anniversary ("modiversary" msg-id). SSN's websocket IRC source
+       (sources/websocket/twitch.js) has no dedicated case for it — its default
+       USERNOTICE branch forwards the raw msg-id as the event string with the
+       Twitch system-msg as chatmessage:
+         { event: 'modiversary', chatname: 'Fuzkeren',
+           chatmessage: 'Fuzkeren has been a Moderator for 7 years!' }
+       Previously fell through to type 'unknown' (recorder) / dropped (dock). */
+    if (p.event === 'modiversary') {
+      var annivText = stripHtml(p.chatmessage || '');
+      return Object.assign({}, base, {
+        type: 'mod_anniversary',
+        user: userFromPayload(p),
+        message: { text: annivText, html: p.chatmessage || '' },
+        meta: parseTwitchModAnniversary(annivText) || {}
+      });
+    }
+
     if (p.event === 'cheer') {
       /* Twitch bits / YT cheers / TikTok diamond bundle. meta.bits is canonical. */
       var bits = (p.meta && p.meta.bits) || null;
@@ -364,6 +394,23 @@
           user: userFromPayload(p),
           message: { text: rawText, html: p.chatmessage || '' },
           meta: milestone
+        });
+      }
+      /* Mod anniversary via the DOM-scrape path (sources/twitch.js emits
+         event:true with the notice text). WS path is handled above via the
+         'modiversary' event string; this covers the other source mode. */
+      var modAnniv = parseTwitchModAnniversary(rawText);
+      if (modAnniv) {
+        var annivUser = userFromPayload(p);
+        if (!annivUser.name) {
+          var am = rawText.match(/(\S+)\s+ha(?:s\s+been|r\s+været)\b/i);
+          if (am) annivUser.name = am[1];
+        }
+        return Object.assign({}, base, {
+          type: 'mod_anniversary',
+          user: annivUser,
+          message: { text: rawText, html: p.chatmessage || '' },
+          meta: modAnniv
         });
       }
       var sub = parseTwitchSubDanish(rawText);
@@ -562,7 +609,8 @@
       parseTwitchSubDanish: parseTwitchSubDanish,
       parseTikTokGift: parseTikTokGift,
       parseDonation: parseDonation,
-      parseStreakMilestone: parseStreakMilestone
+      parseStreakMilestone: parseStreakMilestone,
+      parseTwitchModAnniversary: parseTwitchModAnniversary
     }
   };
 

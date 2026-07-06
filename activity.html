@@ -8,7 +8,7 @@
   Same SSN iframe + WS plumbing, different rendering: events instead of chat.
   - Receives raw SSN payloads, runs them through normalizer.js
   - Filters out plain chat (kind=='message'), test, viewer_update (drives stats bar), delete, unknown
-  - Renders sub/resub/gift_sub/gift/donation/cheer/hearts/raid/follow/highlight/system
+  - Renders sub/resub/gift_sub/gift/donation/cheer/hearts/raid/follow/highlight/system/mod_anniversary
 
   URL params:
     ?session=<ssn-room-id>     SSN room id (defaults to host's known room)
@@ -191,6 +191,7 @@ body.dock .activity .platform-icon { width: 14px; height: 14px; border-radius: 3
 .activity.follow     { --edge-color: #4cd137; }
 .activity.highlight  { --edge-color: #ffd700; }
 .activity.system     { --edge-color: #888; }
+.activity.mod_anniversary { --edge-color: #00ad03; }
 .activity.donation   { --edge-color: #FF6A6A; --bg-alpha: 0.6; }
 .activity.cheer      { --edge-color: #00d4ff; --bg-alpha: 0.6; }
 .activity.reward     { --edge-color: #a970ff; }
@@ -477,6 +478,7 @@ function iconFor(ev) {
     case 'highlight':  return '✦';
     case 'reward':     return '🎯';
     case 'system':     return 'ⓘ';
+    case 'mod_anniversary': return '🛡';
     default:           return '·';
   }
 }
@@ -502,6 +504,7 @@ function fmtMeta(ev) {
   else if (m.tier)        bits.push('Tier ' + m.tier);
   if (m.membership && !m.tier) bits.push(m.membership); // canonical subs carry text not numeric tier
   if (m.months)    bits.push(m.months + ' mo');
+  if (m.years)     bits.push(m.years + ' yr');
   if (m.streak)    bits.push(m.streak + ' streak');
   if (m.recipient) bits.push('→ ' + m.recipient);
   if (m.gifter_total) bits.push(m.gifter_total + ' total gifts');
@@ -814,6 +817,7 @@ if (fakeData) {
     { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    message: { text: 'liked' }, meta: {} },
     { type: 'gift_sub',   platform: 'twitch',  user: { name: 'Viprcsgo' },        message: { text: '' }, meta: { tier: 1, recipient: 'Klovn', gifter_total: 14 } },
     { type: 'raid',       platform: 'twitch',  user: { name: '' },                amount: { value: 22, unit: 'viewers' }, message: { text: 'gruppe på 22' }, meta: { viewer_count: 22 } },
+    { type: 'mod_anniversary', platform: 'twitch', user: { name: 'Fuzkeren' },    message: { text: 'Fuzkeren has been a Moderator for 7 years!' }, meta: { years: 7 } },
     { type: 'highlight',  platform: 'twitch',  user: null,                        message: { text: 'Delt chat startet!' }, meta: { fragments: ['Delt chat startet!'] } }
   ];
   samples.forEach(function (e, i) { setTimeout(function () { handleCanonical(e); }, 200 * (i + 1)); });
