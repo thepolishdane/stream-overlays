@@ -18,6 +18,11 @@
     &maxitems=N                max rows in scrolling history (default 30)
     &server=<wss-url>          extra socket server (matches chat overlay)
     &capture=true              same JSON capture mode as chat overlay (forensic)
+    &statsbridge=<ws-url>      loopback likes feed from ssn-stream-stats recorder
+                               (ws://127.0.0.1:8913) — REQUIRED for TikTok likes,
+                               SSN's own feed can't deliver them
+    &likesound=true            audible chime when a like burst starts (default off;
+                               beware desktop-audio capture bleeding it into stream)
 -->
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
@@ -195,6 +200,8 @@ body.dock .activity .platform-icon { width: 14px; height: 14px; border-radius: 3
 .activity.donation   { --edge-color: #FF6A6A; --bg-alpha: 0.6; }
 .activity.cheer      { --edge-color: #00d4ff; --bg-alpha: 0.6; }
 .activity.reward     { --edge-color: #a970ff; }
+.activity.like       { --edge-color: #fe2c55; --bg-alpha: 0.6; }
+.activity.like .amount { color: #ff8fa3; }
 
 /* Streak row in pinned-feed */
 .streak {
@@ -208,6 +215,39 @@ body.dock .activity .platform-icon { width: 14px; height: 14px; border-radius: 3
 }
 .streak .user { font-weight: 700; }
 .streak .count { margin-left: auto; font-weight: 700; color: #ffd700; font-variant-numeric: tabular-nums; }
+.streak .meta-line {
+  font-family: 'Inter', sans-serif;
+  font-size: 0.75em; font-weight: 600;
+  color: rgba(255,255,255,0.6);
+  text-transform: uppercase; letter-spacing: 0.4px;
+}
+
+/* Likes get a deliberately loud treatment — the whole point is spotting them
+   live so the streamer can say thanks. Joins stay minimal by design. */
+.streak.like {
+  --edge-color: #fe2c55;
+  font-size: 0.95em;
+  background: linear-gradient(90deg, rgba(254,44,85,0.30), rgba(0,0,0,0.55) 65%);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 6px 12px 6px 14px;
+  box-shadow: 0 0 14px rgba(254,44,85,0.35);
+}
+.streak.like .heart {
+  display: inline-block;
+  animation: like-beat 0.9s ease-in-out infinite;
+}
+@keyframes like-beat {
+  0%, 100% { transform: scale(1); }
+  30%      { transform: scale(1.35); }
+}
+.streak.like .count { color: #ff8fa3; font-size: 1.15em; }
+.streak .bump {
+  position: absolute; right: 10px; top: -0.9em;
+  font-weight: 800; color: #ff8fa3;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
 
 /* Dock mode — matches chat overlay. Stats bar lives on the chat dock only;
    the activity dock takes the full height. */
@@ -299,10 +339,15 @@ fetch('activity-feed/tiktok-gifts.json?_=' + Date.now())
 /* --- canonical event handler --- */
 var FEED_TYPES_SKIP = { message: 1, viewer_update: 1, delete: 1, test: 1, unknown: 1 };
 
-/* high-volume per-user types: streak grouping in pinned-feed, lock-to-feed after 10s */
+/* high-volume per-user types: streak grouping in pinned-feed, lock-to-feed after
+   inactivity. Likes linger 45s: TikTok likes land in short bursts a few times per
+   stream (session 16: all 758 likes inside 4 minutes of a 224-min stream) — a 10s
+   lock made the pinned row vanish before the streamer ever glanced at the dock. */
 var STREAK_TYPES = { like: 1 };
 var STREAK_INACTIVITY_MS = 10000;
+var STREAK_INACTIVITY_BY_TYPE = { like: 45000 };
 var streaks = {}; /* key = type + '|' + user, value = {row, count, lastTs, timer} */
+var likeStreamTotals = {}; /* user -> cumulative likes this page-load (≈ this stream) */
 
 /* high-volume one-shot-per-user types: FIFO ticker, never lock to main feed */
 var TICKER_TYPES = { join: 1 };
@@ -403,15 +448,19 @@ function streakKey(ev) { return ev.type + '|' + (ev.user && ev.user.name || '?')
 function addToStreak(ev) {
   var key = streakKey(ev);
   var s = streaks[key];
+  var isLike = ev.type === 'like';
   if (!s) {
     var row = document.createElement('div');
     row.className = 'streak ' + ev.type;
-    row.style.setProperty('--edge-color', getComputedStyle(document.documentElement).getPropertyValue('--edge-color') || '#4cd137');
-    row.innerHTML = platformIconHtml(ev.platform) + '<span class="user"></span><span class="meta-line"></span><span class="count">×<span class="num">1</span></span>';
+    row.innerHTML = platformIconHtml(ev.platform)
+      + (isLike ? '<span class="heart">❤</span>' : '')
+      + '<span class="user"></span><span class="meta-line"></span>'
+      + '<span class="count">' + (isLike ? '<span class="num">0</span> ❤' : '×<span class="num">1</span>') + '</span>';
     document.getElementById('pinned-feed').appendChild(row);
     s = streaks[key] = { row: row, count: 0, lastTs: 0, timer: null, ev: ev };
     row.querySelector('.user').textContent = ev.user.name;
-    row.querySelector('.meta-line').textContent = (ev.platform || '') + ' · ' + ev.type;
+    row.querySelector('.meta-line').textContent = isLike ? 'sending likes' : (ev.platform || '') + ' · ' + ev.type;
+    if (isLike) likeChime();
   }
   /* Batched events (e.g. TikTok likes from the stats bridge) carry a real count in
      amount.value / meta.batched — add it so the row shows the true total, not the
@@ -420,19 +469,74 @@ function addToStreak(ev) {
   s.count += inc;
   s.lastTs = Date.now();
   s.row.querySelector('.num').textContent = s.count;
+  if (isLike) {
+    likeStreamTotals[ev.user.name] = (likeStreamTotals[ev.user.name] || 0) + inc;
+    spawnBump(s.row, inc);
+    if (typeof s.row.animate === 'function') {
+      s.row.animate([{ filter: 'brightness(1.7)' }, { filter: 'brightness(1)' }], { duration: 450, easing: 'ease-out' });
+    }
+  }
   if (s.timer) clearTimeout(s.timer);
-  s.timer = setTimeout(function () { lockStreak(key); }, STREAK_INACTIVITY_MS);
+  s.timer = setTimeout(function () { lockStreak(key); }, STREAK_INACTIVITY_BY_TYPE[ev.type] || STREAK_INACTIVITY_MS);
 }
+
+/* floating "+N" that rises off the streak row on every batch — makes the moment
+   likes land visible in peripheral vision, not just the counter silently changing */
+function spawnBump(row, inc) {
+  if (typeof row.animate !== 'function') return;
+  var b = document.createElement('span');
+  b.className = 'bump';
+  b.textContent = '+' + inc;
+  row.appendChild(b);
+  var a = b.animate(
+    [{ opacity: 1, transform: 'translateY(0)' }, { opacity: 0, transform: 'translateY(-16px)' }],
+    { duration: 700, easing: 'ease-out' }
+  );
+  a.onfinish = function () { b.parentNode && b.parentNode.removeChild(b); };
+}
+
 function lockStreak(key) {
   var s = streaks[key]; if (!s) return;
   delete streaks[key];
+  s.row.parentNode && s.row.parentNode.removeChild(s.row);
   /* turn the pinned streak into a single feed entry with final count */
   var ev = Object.assign({}, s.ev, {
     meta: Object.assign({}, s.ev.meta || {}, { streak_total: s.count, streak_locked: true })
   });
-  s.row.parentNode && s.row.parentNode.removeChild(s.row);
-  ev._streakLabel = s.count + '× ' + ev.type;
+  if (s.ev.type === 'like') {
+    /* likes lock into a full-size pink feed entry: "LIKES user  173 ❤", with the
+       user's running stream total in the meta line when this wasn't their first burst */
+    ev.amount = { value: s.count, unit: 'likes', raw: String(s.count) };
+    delete ev.meta.streak_total;
+    var total = likeStreamTotals[s.ev.user && s.ev.user.name] || 0;
+    if (total > s.count) ev.meta.stream_total = total;
+    ev._streakLabel = 'likes';
+  } else {
+    ev._streakLabel = s.count + '× ' + ev.type;
+  }
   addToFeed(ev);
+}
+
+/* Opt-in ?likesound=true — short two-note chime when a like burst STARTS (once per
+   burst, not per batch). WebAudio, no asset files. Off by default: OBS dock audio
+   plays on desktop and can bleed into the stream via desktop-audio capture. */
+var likeSound = urlParams.has('likesound') && urlParams.get('likesound') !== 'false';
+var likeAudioCtx = null;
+function likeChime() {
+  if (!likeSound) return;
+  try {
+    likeAudioCtx = likeAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    var t = likeAudioCtx.currentTime;
+    [880, 1318].forEach(function (freq, i) {
+      var o = likeAudioCtx.createOscillator(), g = likeAudioCtx.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t + i * 0.09);
+      g.gain.exponentialRampToValueAtTime(0.12, t + i * 0.09 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + i * 0.09 + 0.25);
+      o.connect(g); g.connect(likeAudioCtx.destination);
+      o.start(t + i * 0.09); o.stop(t + i * 0.09 + 0.3);
+    });
+  } catch (_) { /* audio blocked — visual redesign carries it */ }
 }
 
 /* --- main feed rendering --- */
@@ -488,6 +592,7 @@ function fmtAmount(amount) {
   if (amount.unit === 'coins') return amount.value + ' coins';
   if (amount.unit === 'gold')  return amount.value + ' SC';
   if (amount.unit === 'hearts')return amount.value + ' ❤';
+  if (amount.unit === 'likes') return amount.value + ' ❤';
   if (amount.unit === 'viewers') return amount.value + ' viewers';
   /* SE tips: amount.unit is a 3-letter currency code, render with symbol prefix */
   var currencySymbols = { usd: '$', eur: '€', gbp: '£', dkk: 'kr ', sek: 'kr ', nok: 'kr ', jpy: '¥' };
@@ -516,6 +621,7 @@ function fmtMeta(ev) {
   else if (m.count && m.count > 1) bits.push('×' + m.count);
   if (m.reward) bits.push(m.reward + (m.cost ? ' · ' + m.cost + ' pts' : ''));
   if (m.streak_total) bits.push(m.streak_total + '× total');
+  if (m.stream_total) bits.push(m.stream_total + ' ❤ this stream');
   if (m.source_channel) bits.push('via ' + m.source_channel);
   return bits.join(' · ');
 }
@@ -812,9 +918,9 @@ if (fakeData) {
     { type: 'gift',       platform: 'tiktok',  user: { name: 'ItZ168days' },      amount: { value: 1, unit: 'coins', raw: 'Synes godt om mig x 1' }, message: { text: 'har sendt Synes godt om mig x 1' }, meta: { gift_name: 'Synes godt om mig', count: 1 } },
     { type: 'join',       platform: 'tiktok',  user: { name: 'casual_viewer' },   message: { text: '' }, meta: {} },
     { type: 'resub',      platform: 'twitch',  user: { name: 'rich_mukkelguden' },message: { text: '' }, meta: { tier: 1, months: 60, streak: 6 } },
-    { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    message: { text: 'liked' }, meta: {} },
-    { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    message: { text: 'liked' }, meta: {} },
-    { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    message: { text: 'liked' }, meta: {} },
+    { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    amount: { value: 15, unit: 'likes' }, message: { text: '' }, meta: { batched: 15 } },
+    { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    amount: { value: 14, unit: 'likes' }, message: { text: '' }, meta: { batched: 14 } },
+    { type: 'like',       platform: 'tiktok',  user: { name: 'mikkel_hearts' },   amount: { value: 8,  unit: 'likes' }, message: { text: '' }, meta: { batched: 8 } },
     { type: 'gift_sub',   platform: 'twitch',  user: { name: 'Viprcsgo' },        message: { text: '' }, meta: { tier: 1, recipient: 'Klovn', gifter_total: 14 } },
     { type: 'raid',       platform: 'twitch',  user: { name: '' },                amount: { value: 22, unit: 'viewers' }, message: { text: 'gruppe på 22' }, meta: { viewer_count: 22 } },
     { type: 'mod_anniversary', platform: 'twitch', user: { name: 'Fuzkeren' },    message: { text: 'Fuzkeren has been a Moderator for 7 years!' }, meta: { years: 7 } },
