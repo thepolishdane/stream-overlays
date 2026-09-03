@@ -229,6 +229,12 @@ body.dock .activity .platform-icon { width: 14px; height: 14px; border-radius: 3
   letter-spacing: 0.2px;
   white-space: nowrap;
 }
+/* Pinned streak rows don't wrap, so a long name + long handle on one line pushed
+   the like count off the right edge of a narrow dock. Stack the handle under the
+   name there; feed rows (row1 wraps) keep them inline. */
+.streak .who { flex-direction: column; align-items: flex-start; gap: 0; line-height: 1.15; }
+.streak .handle { font-size: 0.68em; }
+.streak .meta-line { white-space: nowrap; }
 .streak .meta-line {
   font-family: 'Inter', sans-serif;
   font-size: 0.75em; font-weight: 600;
