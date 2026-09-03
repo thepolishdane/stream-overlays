@@ -99,9 +99,14 @@
     return { gift_name: m[1].trim(), count: parseInt(m[2], 10), raw_text: text };
   }
 
+  /* name = display name (chatname). username/id are forwarded when the source
+     carries them (SSN's TikTok DOM scrape does NOT — only chatname); the activity
+     dock keys per-user streaks on username → id → name in that order. */
   function userFromPayload(p) {
     return {
       name: p.chatname || '',
+      username: p.username || '',
+      id: p.userid != null && p.userid !== '' ? String(p.userid) : '',
       avatar: p.chatimg || '',
       color: p.nameColor || '',
       badges: p.chatbadges || [],

@@ -215,6 +215,20 @@ body.dock .activity .platform-icon { width: 14px; height: 14px; border-radius: 3
 }
 .streak .user { font-weight: 700; }
 .streak .count { margin-left: auto; font-weight: 700; color: #ffd700; font-variant-numeric: tabular-nums; }
+
+/* Display name + @handle side by side. TikTok display names are free text (can be
+   garbage, emoji, or change mid-stream); the handle is the stable id. Bridge events
+   carry both, SSN events pick the handle up via the alias map. Handle is hidden
+   when it merely repeats the name. */
+.who { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0; }
+.handle {
+  font-family: 'Inter', sans-serif;
+  font-weight: 500;
+  font-size: 0.72em;
+  color: rgba(255, 255, 255, 0.55);
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
 .streak .meta-line {
   font-family: 'Inter', sans-serif;
   font-size: 0.75em; font-weight: 600;
@@ -346,8 +360,41 @@ var FEED_TYPES_SKIP = { message: 1, viewer_update: 1, delete: 1, test: 1, unknow
 var STREAK_TYPES = { like: 1 };
 var STREAK_INACTIVITY_MS = 10000;
 var STREAK_INACTIVITY_BY_TYPE = { like: 45000 };
-var streaks = {}; /* key = type + '|' + user, value = {row, count, lastTs, timer} */
-var likeStreamTotals = {}; /* user -> cumulative likes this page-load (≈ this stream) */
+var streaks = {}; /* key = type + '|' + identityKey(user), value = {row, count, lastTs, timer, ev} */
+var likeStreamTotals = {}; /* identityKey(user) -> cumulative likes this page-load (≈ this stream) */
+var bridgeLive = false;   /* stats-bridge socket open → it owns TikTok likes (see ingest) */
+
+/* --- identity ---
+   One person can reach the dock under two names. SSN's feed only knows the DISPLAY
+   name (chatname: "Tobias Søndergaard"); the stats bridge knows the @handle
+   (TikTok uniqueId: "tobias.sondergaard2") and sends the display name alongside.
+   Keying streaks on whichever name happened to arrive split one liker into two rows
+   (1 ❤ under the display name, 116 ❤ under the handle). Key on the handle when we
+   have one and remember display name → handle, so a name-only event lands on the
+   same row and the row shows BOTH names. */
+var aliasByName = {}; /* lowercased display name -> { username, id } */
+function identityKey(u) {
+  if (!u) return '?';
+  return String(u.username || u.id || u.name || '?').toLowerCase();
+}
+function enrichUser(ev) {
+  var u = ev && ev.user; if (!u || !u.name) return;
+  var nameKey = String(u.name).toLowerCase();
+  if (u.username || u.id) {
+    aliasByName[nameKey] = { username: u.username || '', id: u.id || '' };
+  } else {
+    var known = aliasByName[nameKey];
+    if (known) { u.username = known.username; u.id = known.id; }
+  }
+}
+function userHtml(u) {
+  if (!u || !u.name) return '';
+  var html = '<span class="who"><span class="user">' + escapeHtml(u.name) + '</span>';
+  if (u.username && String(u.username).toLowerCase() !== String(u.name).toLowerCase()) {
+    html += '<span class="handle">@' + escapeHtml(u.username) + '</span>';
+  }
+  return html + '</span>';
+}
 
 /* high-volume one-shot-per-user types: FIFO ticker, never lock to main feed */
 var TICKER_TYPES = { join: 1 };
@@ -396,7 +443,19 @@ function ingest(payload, source) {
   var n = window.SSNNormalize.normalize(entry, { giftLookup: giftLookup });
   if (!n) return;
   var arr = Array.isArray(n) ? n : [n];
-  arr.forEach(handleCanonical);
+  arr.forEach(function (ev) {
+    /* While the stats bridge is live it is the authoritative TikTok like source
+       (real batch counts, handle + display name). SSN's DOM scrape only catches the
+       odd "X liked" toast (~0.2% of likes), under the display name alone — letting
+       it through double-counts the liker. Same policy the recorder applies to its
+       DB (directActive drops SSN's TikTok events). Bridge down → SSN likes pass
+       as a fallback and get merged by the alias map if the bridge comes back. */
+    if (bridgeLive && ev.type === 'like' && ev.platform === 'tiktok') {
+      if (debugMode) console.log('[activity-debug] drop SSN tiktok like (bridge live):', ev.user && ev.user.name);
+      return;
+    }
+    handleCanonical(ev);
+  });
 }
 
 function handleCanonical(ev) {
@@ -405,6 +464,7 @@ function handleCanonical(ev) {
     return;
   }
   if (FEED_TYPES_SKIP[ev.type]) return;
+  enrichUser(ev);
   if (TICKER_TYPES[ev.type] && ev.user && ev.user.name) {
     addToTicker(ev);
     return;
@@ -430,7 +490,7 @@ function addToTicker(ev) {
     ticker.appendChild(row);
   }
   row.innerHTML = platformIconHtml(ev.platform)
-    + '<span class="user">' + escapeHtml(ev.user.name) + '</span>'
+    + userHtml(ev.user)
     + '<span class="label">' + ev.type + '</span>';
   if (typeof row.animate === 'function') {
     row.animate(
@@ -444,9 +504,39 @@ function addToTicker(ev) {
 }
 
 /* --- streak slot (pinned, locks after inactivity) --- */
-function streakKey(ev) { return ev.type + '|' + (ev.user && ev.user.name || '?'); }
+function streakKey(ev) { return ev.type + '|' + identityKey(ev.user); }
+
+/* A streak opened under the display name alone (SSN event before the handle was
+   known) is folded into the handle-keyed streak as soon as an event carrying the
+   handle arrives — counts, row and stream total move over, the duplicate row goes. */
+function adoptNameOnlyStreak(ev) {
+  var u = ev.user;
+  if (!u || !u.name || !(u.username || u.id)) return;
+  var nameKey = String(u.name).toLowerCase();
+  var from = ev.type + '|' + nameKey, to = streakKey(ev);
+  var old = streaks[from];
+  if (from === to || !old) return;
+  var cur = streaks[to];
+  if (cur) {
+    cur.count += old.count;
+    cur.row.querySelector('.num').textContent = cur.count;
+    if (old.timer) clearTimeout(old.timer);
+    old.row.parentNode && old.row.parentNode.removeChild(old.row);
+  } else {
+    streaks[to] = old; /* timer is re-armed with the new key by addToStreak */
+  }
+  delete streaks[from];
+  if (ev.type === 'like' && likeStreamTotals[nameKey]) {
+    var idKey = identityKey(u);
+    likeStreamTotals[idKey] = (likeStreamTotals[idKey] || 0) + likeStreamTotals[nameKey];
+    delete likeStreamTotals[nameKey];
+  }
+}
+
 function addToStreak(ev) {
+  adoptNameOnlyStreak(ev);
   var key = streakKey(ev);
+  var idKey = identityKey(ev.user);
   var s = streaks[key];
   var isLike = ev.type === 'like';
   if (!s) {
@@ -454,13 +544,18 @@ function addToStreak(ev) {
     row.className = 'streak ' + ev.type;
     row.innerHTML = platformIconHtml(ev.platform)
       + (isLike ? '<span class="heart">❤</span>' : '')
-      + '<span class="user"></span><span class="meta-line"></span>'
+      + '<span class="who-slot"></span><span class="meta-line"></span>'
       + '<span class="count">' + (isLike ? '<span class="num">0</span> ❤' : '×<span class="num">1</span>') + '</span>';
     document.getElementById('pinned-feed').appendChild(row);
     s = streaks[key] = { row: row, count: 0, lastTs: 0, timer: null, ev: ev };
-    row.querySelector('.user').textContent = ev.user.name;
+    row.querySelector('.who-slot').innerHTML = userHtml(ev.user);
     row.querySelector('.meta-line').textContent = isLike ? 'sending likes' : (ev.platform || '') + ' · ' + ev.type;
     if (isLike) likeChime();
+  } else if (ev.user.username && !(s.ev.user && s.ev.user.username)) {
+    /* first event with the handle for a row that opened name-only: upgrade the
+       stored event (lockStreak renders from it) and show the handle now */
+    s.ev = ev;
+    s.row.querySelector('.who-slot').innerHTML = userHtml(ev.user);
   }
   /* Batched events (e.g. TikTok likes from the stats bridge) carry a real count in
      amount.value / meta.batched — add it so the row shows the true total, not the
@@ -470,7 +565,7 @@ function addToStreak(ev) {
   s.lastTs = Date.now();
   s.row.querySelector('.num').textContent = s.count;
   if (isLike) {
-    likeStreamTotals[ev.user.name] = (likeStreamTotals[ev.user.name] || 0) + inc;
+    likeStreamTotals[idKey] = (likeStreamTotals[idKey] || 0) + inc;
     spawnBump(s.row, inc);
     if (typeof s.row.animate === 'function') {
       s.row.animate([{ filter: 'brightness(1.7)' }, { filter: 'brightness(1)' }], { duration: 450, easing: 'ease-out' });
@@ -508,7 +603,7 @@ function lockStreak(key) {
        user's running stream total in the meta line when this wasn't their first burst */
     ev.amount = { value: s.count, unit: 'likes', raw: String(s.count) };
     delete ev.meta.streak_total;
-    var total = likeStreamTotals[s.ev.user && s.ev.user.name] || 0;
+    var total = likeStreamTotals[identityKey(s.ev.user)] || 0;
     if (total > s.count) ev.meta.stream_total = total;
     ev._streakLabel = 'likes';
   } else {
@@ -663,7 +758,6 @@ function addToFeed(ev) {
   var div = document.createElement('div');
   div.className = 'activity ' + ev.type;
   var label = ev._streakLabel || ev.type.replace('_', ' ');
-  var userName = (ev.user && ev.user.name) || '';
   var bodyText = ev.message && ev.message.text ? ev.message.text : '';
   if (bodyText.length > 140) bodyText = bodyText.slice(0, 137) + '…';
   var amount = fmtAmount(ev.amount);
@@ -672,7 +766,7 @@ function addToFeed(ev) {
   var html = '<div class="row1">'
     + platformIconHtml(ev.platform)
     + '<span class="label">' + escapeHtml(label) + '</span>';
-  if (userName) html += '<span class="user">' + escapeHtml(userName) + '</span>';
+  html += userHtml(ev.user); /* '' when the event has no user (raids, highlights) */
   if (amount)   html += '<span class="amount">' + escapeHtml(amount) + '</span>';
   html += '</div>';
   /* Body line is only useful when the user typed something unique that isn't already
@@ -895,13 +989,13 @@ if (urlParams.has("server") || urlParams.has("server2")) {
   var bws = null, retry = 1;
   function conn() {
     try { bws = new WebSocket(bridgeURL); } catch (e) { return; }
-    bws.onopen = function () { retry = 1; };
+    bws.onopen = function () { retry = 1; bridgeLive = true; };
     bws.onmessage = function (event) {
       if (!event.data) return;
       try { var c = JSON.parse(event.data); if (c && c.type) handleCanonical(c); }
       catch (err) { /* ignore malformed bridge frames */ }
     };
-    bws.onclose = function () { setTimeout(conn, Math.min(1000 * retry++, 15000)); };
+    bws.onclose = function () { bridgeLive = false; setTimeout(conn, Math.min(1000 * retry++, 15000)); };
     bws.onerror = function () { try { bws.close(); } catch (_) {} };
   }
   conn();
@@ -918,9 +1012,13 @@ if (fakeData) {
     { type: 'gift',       platform: 'tiktok',  user: { name: 'ItZ168days' },      amount: { value: 1, unit: 'coins', raw: 'Synes godt om mig x 1' }, message: { text: 'har sendt Synes godt om mig x 1' }, meta: { gift_name: 'Synes godt om mig', count: 1 } },
     { type: 'join',       platform: 'tiktok',  user: { name: 'casual_viewer' },   message: { text: '' }, meta: {} },
     { type: 'resub',      platform: 'twitch',  user: { name: 'rich_mukkelguden' },message: { text: '' }, meta: { tier: 1, months: 60, streak: 6 } },
-    { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    amount: { value: 15, unit: 'likes' }, message: { text: '' }, meta: { batched: 15 } },
-    { type: 'like',       platform: 'tiktok',  user: { name: 'spammer_jane' },    amount: { value: 14, unit: 'likes' }, message: { text: '' }, meta: { batched: 14 } },
-    { type: 'like',       platform: 'tiktok',  user: { name: 'mikkel_hearts' },   amount: { value: 8,  unit: 'likes' }, message: { text: '' }, meta: { batched: 8 } },
+    /* bridge shape: display name + @handle (+ numeric id) — row shows both */
+    { type: 'like',       platform: 'tiktok',  user: { name: 'Spammer Jane 🌸', username: 'spammer_jane', id: '7011' }, amount: { value: 15, unit: 'likes' }, message: { text: '' }, meta: { batched: 15 } },
+    { type: 'like',       platform: 'tiktok',  user: { name: 'Spammer Jane 🌸', username: 'spammer_jane', id: '7011' }, amount: { value: 14, unit: 'likes' }, message: { text: '' }, meta: { batched: 14 } },
+    /* regression for the split-row bug: SSN's name-only like first, then the bridge's
+       handle-carrying like for the same person → ONE row, 1 + 8 = 9 ❤ */
+    { type: 'like',       platform: 'tiktok',  user: { name: 'Mikkel Hearts' },   message: { text: 'har liket denne LIVE' }, meta: {} },
+    { type: 'like',       platform: 'tiktok',  user: { name: 'Mikkel Hearts', username: 'mikkel_hearts' }, amount: { value: 8,  unit: 'likes' }, message: { text: '' }, meta: { batched: 8 } },
     { type: 'gift_sub',   platform: 'twitch',  user: { name: 'Viprcsgo' },        message: { text: '' }, meta: { tier: 1, recipient: 'Klovn', gifter_total: 14 } },
     { type: 'raid',       platform: 'twitch',  user: { name: '' },                amount: { value: 22, unit: 'viewers' }, message: { text: 'gruppe på 22' }, meta: { viewer_count: 22 } },
     { type: 'mod_anniversary', platform: 'twitch', user: { name: 'Fuzkeren' },    message: { text: 'Fuzkeren has been a Moderator for 7 years!' }, meta: { years: 7 } },
