@@ -518,6 +518,7 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
     var scrollMode = urlParams.has("scroll") && urlParams.get("scroll") !== "false";
     var debugMode = urlParams.has("debug") && urlParams.get("debug") !== "false";
     var captureMode = urlParams.has("capture") && urlParams.get("capture") !== "false";
+    var dockMode = urlParams.get("isdock") === "true";
     var latestPlatformCounts = {};
 
     var twitchHostChannel = urlParams.has("twitchchannel")
@@ -1331,6 +1332,7 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
 			</div>
 			${contentImgHtml}
 		`;
+		if (dockMode) linkifyText(messageDiv.querySelector('.text'));
 
 		if (reversed) {
 			// In reverse mode, insert new messages at the top (after spacer if present)
@@ -1462,6 +1464,50 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
             #chat-container { top: 28px !important; height: calc(100vh - 28px) !important; bottom: 0 !important; }
         `;
         document.head.appendChild(dockStyles);
+    }
+
+    // --- CLICKABLE LINKS (dock only) ---
+    // Plain-text URLs in chat become <a>; any link click goes through
+    // window.open, which OBS browser docks hand to the default system browser
+    // (a normal navigation would replace the dock itself).
+    var URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>"']+[^\s<>"'.,;:!?)\]]/gi;
+    function linkifyText(root) {
+        if (!root) return;
+        var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        var nodes = [];
+        while (walker.nextNode()) {
+            if (!walker.currentNode.parentNode.closest('a')) nodes.push(walker.currentNode);
+        }
+        nodes.forEach(function (node) {
+            var text = node.nodeValue;
+            URL_RE.lastIndex = 0;
+            if (!URL_RE.test(text)) return;
+            var frag = document.createDocumentFragment();
+            var last = 0;
+            text.replace(URL_RE, function (m, idx) {
+                frag.appendChild(document.createTextNode(text.slice(last, idx)));
+                var a = document.createElement('a');
+                a.href = /^www\./i.test(m) ? 'https://' + m : m;
+                a.textContent = m;
+                frag.appendChild(a);
+                last = idx + m.length;
+            });
+            frag.appendChild(document.createTextNode(text.slice(last)));
+            node.parentNode.replaceChild(frag, node);
+        });
+    }
+    if (dockMode) {
+        const linkStyles = document.createElement('style');
+        linkStyles.innerHTML = `
+            .text a { color: #8ab4ff !important; text-decoration: underline !important; cursor: pointer; word-break: break-all; }
+        `;
+        document.head.appendChild(linkStyles);
+        document.addEventListener('click', function (e) {
+            var a = e.target.closest && e.target.closest('#chat-container a[href]');
+            if (!a || !/^https?:/i.test(a.href)) return;
+            e.preventDefault();
+            window.open(a.href, '_blank');
+        });
     }
 
     // ============================================================
