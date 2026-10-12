@@ -23,6 +23,9 @@
                                SSN's own feed can't deliver them
     &likesound=true            audible chime when a like burst starts (default off;
                                beware desktop-audio capture bleeding it into stream)
+  With isdock=true + statsbridge (and NOT inside the Electron overlay) the dock also gets
+  the alert controls: mute / skip / volume bar and a tiny replay button on TikTok + YouTube
+  rows. They talk to the recorder's /alerts/* routes on the statsbridge host.
 -->
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
@@ -280,6 +283,28 @@ body.dock #activity-container { padding: 8px; }
 body.dock .activity { padding: 5px 8px 5px 12px; border-radius: 4px; }
 body.dock .activity .icon { width: 18px; height: 18px; font-size: 13px; }
 body.dock .activity .row1 { gap: 6px; }
+
+/* Alert controls (dock only, see "alert controls" in the script) */
+#alert-bar {
+  display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  padding: 0 0 6px; border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  font-size: 13px; text-shadow: none;
+}
+#alert-bar button {
+  background: rgba(255, 255, 255, 0.08); border: 0; border-radius: 3px;
+  color: #fff; font-size: 13px; line-height: 1; padding: 4px 7px; cursor: pointer;
+}
+#alert-bar button:hover { background: rgba(255, 255, 255, 0.2); }
+#alert-bar button.off { opacity: 0.55; }
+#alert-bar input[type=range] { flex: 1 1 auto; min-width: 40px; height: 14px; margin: 0; accent-color: #fe2c55; }
+.replay {
+  flex: 0 0 auto; margin: 0 0 0 6px; padding: 0; border: 0; background: none;
+  color: #fff; font: inherit; font-size: 11px; line-height: 1; text-shadow: none;
+  opacity: 0.35; cursor: pointer;
+}
+.replay:hover { opacity: 1; }
+.row1 > .replay { margin-left: auto; }
+.amount + .replay { margin-left: 6px; }
 
 /* Debug banner */
 #debug-banner {
@@ -557,6 +582,7 @@ function addToStreak(ev) {
     row.querySelector('.who-slot').innerHTML = userHtml(ev.user);
     row.querySelector('.meta-line').textContent = isLike ? 'sending likes' : (ev.platform || '') + ' · ' + ev.type;
     if (isLike) likeChime();
+    if (canReplay(ev)) s.row.appendChild(replayButton(function () { return replayPayload(s.ev, s.count); }));
   } else if (ev.user.username && !(s.ev.user && s.ev.user.username)) {
     /* first event with the handle for a row that opened name-only: upgrade the
        stored event (lockStreak renders from it) and show the handle now */
@@ -787,6 +813,7 @@ function addToFeed(ev) {
   }
   if (meta) html += '<div class="meta-line">' + escapeHtml(meta) + '</div>';
   div.innerHTML = html;
+  if (canReplay(ev)) div.querySelector('.row1').appendChild(replayButton(function () { return replayPayload(ev); }));
   if (ev.type === 'highlight') {
     var newKey = highlightKey(ev);
     div.setAttribute('data-highlight-key', newKey);
@@ -984,6 +1011,75 @@ if (urlParams.has("server") || urlParams.has("server2")) {
   setupSocket();
 }
 
+/* --- alert controls: mute / skip / volume bar + per-row replay ↻ ---
+   Talk to the recorder's alert queue over HTTP on the statsbridge host (no extra
+   param). Dock only, and never inside the Electron overlay: that window is click-through
+   and may be captured on stream, so controls there would be both useless and visible. */
+var bridgeHttp = (urlParams.get('statsbridge') || '').replace(/^ws/i, 'http').replace(/\/+$/, '');
+var controlsOn = isDock && !!bridgeHttp && !/Electron/.test(navigator.userAgent);
+var alertState = { muted: false, volume: 1 };
+var muteBtn = null, volSlider = null;
+
+function alertPost(path, body) {
+  try {
+    fetch(bridgeHttp + '/alerts/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
+      .catch(function () { /* recorder down / offline preview */ });
+  } catch (_) {}
+}
+
+function applyAlertState(s) {
+  if (typeof s.muted === 'boolean') alertState.muted = s.muted;
+  if (typeof s.volume === 'number') alertState.volume = s.volume;
+  if (!muteBtn) return;
+  muteBtn.textContent = alertState.muted ? '🔇' : '🔊';
+  muteBtn.classList.toggle('off', alertState.muted);
+  if (document.activeElement !== volSlider) volSlider.value = Math.round(alertState.volume * 100);
+}
+
+if (controlsOn) {
+  var bar = document.createElement('div');
+  bar.id = 'alert-bar';
+  bar.innerHTML = '<button type="button" id="alert-mute" title="Mute alert sounds">🔊</button>'
+    + '<button type="button" id="alert-skip" title="Skip current video alert">⏭</button>'
+    + '<input type="range" id="alert-volume" min="0" max="100" value="100" title="Alert volume">';
+  var cont = document.getElementById('activity-container');
+  cont.insertBefore(bar, cont.firstChild);
+  muteBtn = document.getElementById('alert-mute');
+  volSlider = document.getElementById('alert-volume');
+  muteBtn.onclick = function () {
+    applyAlertState({ muted: !alertState.muted });
+    alertPost('mute', { muted: alertState.muted });
+  };
+  document.getElementById('alert-skip').onclick = function () { alertPost('skip'); };
+  var volTimer = null;
+  volSlider.oninput = function () {
+    alertState.volume = volSlider.value / 100;
+    clearTimeout(volTimer);
+    volTimer = setTimeout(function () { alertPost('volume', { volume: alertState.volume }); }, 120);
+  };
+}
+
+/* Only platforms the recorder has alert rules for. */
+function canReplay(ev) { return controlsOn && (ev.platform === 'tiktok' || ev.platform === 'youtube'); }
+
+/* Event data stays in the closure (never in data-* attributes): `getPayload` is read at click time. */
+function replayButton(getPayload) {
+  var b = document.createElement('button');
+  b.type = 'button'; b.className = 'replay'; b.title = 'Replay alert'; b.textContent = '↻';
+  b.onclick = function (e) { e.stopPropagation(); e.preventDefault(); alertPost('test', getPayload()); };
+  return b;
+}
+
+function replayPayload(ev, amount) {
+  var m = ev.meta || {}, text = (ev.message && ev.message.text) || '';
+  return {
+    platform: ev.platform, type: ev.type,
+    amount: typeof amount === 'number' ? amount : (ev.amount && typeof ev.amount.value === 'number' ? ev.amount.value : null),
+    name: (ev.user && ev.user.name) || '',
+    message: ev.type === 'gift' ? (m.gift_name || text) : text   /* gift rows: gift name, not SSN's "has sent X x 1" */
+  };
+}
+
 /* Optional loopback bridge to the local stats recorder. Supplies canonical events
    the SSN feed can't deliver for TikTok — currently LIKES. Opt-in via
    ?statsbridge=ws://127.0.0.1:8913. Loopback ws:// is exempt from mixed-content
@@ -998,7 +1094,11 @@ if (urlParams.has("server") || urlParams.has("server2")) {
     bws.onopen = function () { retry = 1; bridgeLive = true; };
     bws.onmessage = function (event) {
       if (!event.data) return;
-      try { var c = JSON.parse(event.data); if (c && c.type) handleCanonical(c); }
+      try {
+        var c = JSON.parse(event.data);
+        if (c && c.type) handleCanonical(c);
+        else if (c && c.ch === 'alert-state') applyAlertState(c);   /* other type-less frames (alert play/skip) are canvas-only */
+      }
       catch (err) { /* ignore malformed bridge frames */ }
     };
     bws.onclose = function () { bridgeLive = false; setTimeout(conn, Math.min(1000 * retry++, 15000)); };
