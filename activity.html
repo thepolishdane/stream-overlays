@@ -235,9 +235,18 @@ body.dock .activity .platform-icon { width: 14px; height: 14px; border-radius: 3
 /* Pinned streak rows don't wrap, so a long name + long handle on one line pushed
    the like count off the right edge of a narrow dock. Stack the handle under the
    name there; feed rows (row1 wraps) keep them inline. */
-.streak .who { flex-direction: column; align-items: flex-start; gap: 0; line-height: 1.15; }
+.streak .who { flex-direction: column; align-items: flex-start; gap: 0; line-height: 1.15; max-width: 100%; }
 .streak .handle { font-size: 0.68em; }
-.streak .meta-line { white-space: nowrap; }
+/* Narrow dock: the row never wraps, so decide who gives way. "sending likes" shrinks
+   away first, then the name/handle ellipsize; icon, heart, count and ↻ never shrink. */
+.streak > * { flex-shrink: 0; }
+.streak .meta-line { white-space: nowrap; flex-shrink: 100; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.streak .who-slot { flex-shrink: 1; min-width: 0; overflow: hidden; }
+.streak .who .user, .streak .who .handle { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.streak .count { white-space: nowrap; }
+/* below ~380px a half-cut "SEN…" just looks broken: drop the label entirely */
+.streak { container-type: inline-size; }
+@container (max-width: 380px) { .streak .meta-line { display: none; } }
 .streak .meta-line {
   font-family: 'Inter', sans-serif;
   font-size: 0.75em; font-weight: 600;
@@ -582,7 +591,7 @@ function addToStreak(ev) {
     row.querySelector('.who-slot').innerHTML = userHtml(ev.user);
     row.querySelector('.meta-line').textContent = isLike ? 'sending likes' : (ev.platform || '') + ' · ' + ev.type;
     if (isLike) likeChime();
-    if (canReplay(ev)) s.row.appendChild(replayButton(function () { return replayPayload(s.ev, s.count); }));
+    /* no ↻ here: a running streak hasn't alerted yet; the locked feed row gets one */
   } else if (ev.user.username && !(s.ev.user && s.ev.user.username)) {
     /* first event with the handle for a row that opened name-only: upgrade the
        stored event (lockStreak renders from it) and show the handle now */
