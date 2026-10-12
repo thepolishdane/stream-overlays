@@ -1467,9 +1467,10 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
     }
 
     // --- CLICKABLE LINKS (dock only) ---
-    // Plain-text URLs in chat become <a>; any link click goes through
-    // window.open, which OBS browser docks hand to the default system browser
-    // (a normal navigation would replace the dock itself).
+    // Plain-text URLs in chat become <a>. Clicks go to the stats recorder's
+    // loopback POST /open (ssn-stream-stats lib/overlay-bridge.js), which opens
+    // the system default browser: OBS docks send window.open to an OBS popup.
+    // Recorder not running -> fall back to that popup.
     var URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>"']+[^\s<>"'.,;:!?)\]]/gi;
     function linkifyText(root) {
         if (!root) return;
@@ -1506,7 +1507,10 @@ body.cap-enabled .stats-pill.stats-capture { display: inline-flex; }
             var a = e.target.closest && e.target.closest('#chat-container a[href]');
             if (!a || !/^https?:/i.test(a.href)) return;
             e.preventDefault();
-            window.open(a.href, '_blank');
+            var href = a.href;
+            fetch('http://127.0.0.1:8913/open', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: href })
+                .then(function (r) { if (!r.ok) throw r.status; })
+                .catch(function () { window.open(href, '_blank'); });
         });
     }
 
