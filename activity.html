@@ -490,8 +490,10 @@ function ingest(payload, source) {
        it through double-counts the liker. Same policy the recorder applies to its
        DB (directActive drops SSN's TikTok events). Bridge down → SSN likes pass
        as a fallback and get merged by the alias map if the bridge comes back. */
-    if (bridgeLive && ev.type === 'like' && ev.platform === 'tiktok') {
-      if (debugMode) console.log('[activity-debug] drop SSN tiktok like (bridge live):', ev.user && ev.user.name);
+    /* Gifts too: SSN reads the Danish TikTok UI ("bølgefyrværkeri") and can't price it;
+       the bridge sends the direct tap's gift with real name + diamonds. */
+    if (bridgeLive && (ev.type === 'like' || ev.type === 'gift') && ev.platform === 'tiktok') {
+      if (debugMode) console.log('[activity-debug] drop SSN tiktok ' + ev.type + ' (bridge live):', ev.user && ev.user.name);
       return;
     }
     handleCanonical(ev);
